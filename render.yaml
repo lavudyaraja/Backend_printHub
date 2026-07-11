@@ -1,0 +1,32 @@
+# Render Blueprint — deploys the PrintHub backend.
+# In Render: New + → Blueprint → pick this repo. It reads this file.
+# (Or set the same values manually on an existing Web Service.)
+services:
+  - type: web
+    name: printhub-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true        # Render generates a strong secret
+      - key: ADMIN_SIGNUP_CODE
+        sync: false                # set your own in the dashboard
+      - key: DATABASE_URL
+        sync: false                # paste your Neon connection string
+      - key: MQTT_URL
+        sync: false                # mqtts://user:pass@host:8883 (HiveMQ)
+      - key: BACKEND_URL
+        sync: false                # https://printhub-backend.onrender.com
+      - key: CORS_ORIGINS
+        sync: false                # your admin domain, or *
+      - key: PAYMENT_ENABLED
+        value: "false"
+      - key: PRICE_BW_PAISE
+        value: "200"
+      - key: PRICE_COLOR_PAISE
+        value: "1000"
