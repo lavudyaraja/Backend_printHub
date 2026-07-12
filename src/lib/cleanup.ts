@@ -10,7 +10,14 @@ async function sweep() {
   if (!storageConfigured()) return;
   const cutoff = new Date(Date.now() - TTL_MS);
   const stale = await prisma.document.findMany({
-    where: { deleted: false, createdAt: { lt: cutoff } },
+    where: {
+      deleted: false,
+      createdAt: { lt: cutoff },
+      OR: [
+        { order: null },
+        { order: { status: { in: ["COMPLETED", "FAILED", "CANCELLED"] } } }
+      ]
+    },
   });
   for (const doc of stale) {
     try {

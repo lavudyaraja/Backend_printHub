@@ -202,3 +202,10 @@ model PrintJob {
 
   @@index([status])
 }
+
+model StorageObject {
+  key       String   @id
+  body      Bytes
+  mimeType  String?
+  createdAt DateTime @default(now())
+}

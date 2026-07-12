@@ -10,11 +10,59 @@ import { createNotification } from "../lib/notify";
 import { sendEmail, orderReceiptEmail } from "../lib/mailer";
 import { debitWallet } from "./wallet";
 import { commitTempFile } from "./documents";
+import { putObject } from "../lib/storage";
 
 export const ordersRouter = Router();
 
 const BW_PAISE = Number(process.env.PRICE_BW_PAISE ?? 200);
 const COLOR_PAISE = Number(process.env.PRICE_COLOR_PAISE ?? 1000);
+
+// Generate a valid blank PDF with N pages using strict byte offsets for xref.
+function generateBlankPdf(pagesCount: number): Buffer {
+  const lines: string[] = [];
+  const offsets: number[] = [];
+  
+  let currentOffset = 0;
+  const write = (str: string) => {
+    lines.push(str);
+    currentOffset += Buffer.byteLength(str, 'utf-8');
+  };
+  
+  // Header
+  write(`%PDF-1.4\n`);
+  
+  // Object 1: Catalog
+  offsets.push(currentOffset);
+  write(`1 0 obj\n<</Type /Catalog /Pages 2 0 R>>\nendobj\n`);
+  
+  // Object 2: Pages
+  offsets.push(currentOffset);
+  const kids = Array.from({ length: pagesCount }, (_, i) => `${3 + i} 0 R`).join(' ');
+  write(`2 0 obj\n<</Type /Pages /Kids [${kids}] /Count ${pagesCount}>>\nendobj\n`);
+  
+  // Objects 3 to 3+N-1: Page objects
+  for (let i = 0; i < pagesCount; i++) {
+    offsets.push(currentOffset);
+    write(`${3 + i} 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 595 842]>>\nendobj\n`);
+  }
+  
+  // Xref table
+  const xrefOffset = currentOffset;
+  write(`xref\n`);
+  write(`0 ${3 + pagesCount}\n`);
+  write(`0000000000 65535 f \n`);
+  for (const offset of offsets) {
+    const padded = String(offset).padStart(10, '0');
+    write(`${padded} 00000 n \n`);
+  }
+  
+  // Trailer
+  write(`trailer\n<</Size ${3 + pagesCount}/Root 1 0 R>>\n`);
+  write(`startxref\n${xrefOffset}\n`);
+  write(`%%EOF\n`);
+  
+  return Buffer.from(lines.join(''), 'utf-8');
+}
 
 // Count billable pages from a range string: "all" | "1-3,5" | "1,2,7".
 function countPages(range: string, totalPages: number): number {
@@ -310,6 +358,88 @@ ordersRouter.post("/from-temp", requireAuth, async (req: AuthedRequest, res) => 
   res.json({ order, qrImage });
 });
 
+// Create blank pages order (₹1.00 per page flat rate)
+ordersRouter.post("/blank", requireAuth, async (req: AuthedRequest, res) => {
+  const parsed = z.object({
+    pagesCount: z.number().int().min(1).max(100),
+    copies: z.number().int().min(1).max(10).default(1),
+  }).safeParse(req.body);
+
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.flatten() });
+  }
+
+  const { pagesCount, copies } = parsed.data;
+
+  try {
+    const pdfBuf = generateBlankPdf(pagesCount);
+    const fileKey = `${nanoid()}.pdf`;
+
+    // Save blank PDF buffer to database storage
+    await putObject(fileKey, pdfBuf, "application/pdf");
+
+    // Create Document record
+    const doc = await prisma.document.create({
+      data: {
+        userId: req.user!.userId,
+        fileName: `Blank Pages - ${pagesCount} Sheet(s).pdf`,
+        fileType: "pdf",
+        fileKey,
+        sizeBytes: pdfBuf.length,
+        pageCount: pagesCount,
+      },
+    });
+
+    const costPaise = pagesCount * 100 * copies; // ₹1.00 per page per copy (100 paise)
+    const orderCode = "PH-" + nanoid(6).toUpperCase();
+    const printToken = nanoid(40);
+    const qrData = JSON.stringify({ code: orderCode, token: printToken });
+    const qrImage = await QRCode.toDataURL(qrData);
+
+    const order = await prisma.order.create({
+      data: {
+        orderCode,
+        userId: req.user!.userId,
+        documentId: doc.id,
+        colorMode: "BW",
+        sideMode: "SINGLE",
+        copies,
+        pageRange: "all",
+        pagesToPrint: pagesCount,
+        costPaise,
+        printToken,
+        qrData,
+        status: "READY",
+      },
+    });
+
+    await createNotification(
+      order.userId,
+      "Order placed",
+      `Order ${order.orderCode} for ${pagesCount} blank page(s) created — scan QR at any kiosk to print.`,
+      order.id
+    );
+
+    const buyer = await prisma.user.findUnique({ where: { id: order.userId } });
+    if (buyer?.email) {
+      const { subject, html } = orderReceiptEmail({
+        name: buyer.name,
+        orderCode: order.orderCode,
+        pages: order.pagesToPrint,
+        copies: order.copies,
+        colorMode: order.colorMode,
+        amountPaise: order.costPaise ?? 0,
+      });
+      sendEmail(buyer.email, subject, html);
+    }
+
+    res.json({ order, qrImage });
+  } catch (e: any) {
+    console.error("[orders] create blank order failed", e);
+    res.status(500).json({ error: e.message || "Failed to create blank order" });
+  }
+});
+
 // Ecological statistics.
 ordersRouter.get("/eco-stats", requireAuth, async (req: AuthedRequest, res) => {
   try {
@@ -403,41 +533,63 @@ ordersRouter.post("/print-at", requireAuth, async (req: AuthedRequest, res) => {
 
   // If order is unpaid (READY), debit user wallet now!
   if (order.status === "READY") {
-    const user = await prisma.user.findUnique({ where: { id: req.user!.userId } });
-    if (!user) return res.status(404).json({ error: "User not found" });
-
-    if (user.walletBalancePaise < order.costPaise) {
-      return res.status(402).json({
-        error: "INSUFFICIENT_FUNDS",
-        message: "Insufficient wallet balance. Please top up to print.",
-        costPaise: order.costPaise,
-        walletBalancePaise: user.walletBalancePaise,
-        orderId: order.id,
-        needTopup: true
-      });
-    }
-
     try {
-      await debitWallet(order.userId, order.costPaise, `Print order ${order.orderCode} (released at ${printer.name})`, order.id);
+      await prisma.$transaction(async (tx) => {
+        // Lock and find the user balance
+        const user = await tx.user.findUnique({
+          where: { id: order.userId },
+          select: { walletBalancePaise: true }
+        });
+        if (!user || user.walletBalancePaise < order.costPaise) {
+          throw new Error("INSUFFICIENT_FUNDS");
+        }
+
+        // Debit the wallet
+        const updatedUser = await tx.user.update({
+          where: { id: order.userId },
+          data: { walletBalancePaise: { decrement: order.costPaise } },
+          select: { walletBalancePaise: true }
+        });
+
+        // Record the debit transaction
+        await tx.walletTransaction.create({
+          data: {
+            userId: order.userId,
+            type: "DEBIT",
+            amountPaise: order.costPaise,
+            balancePaise: updatedUser.walletBalancePaise,
+            description: `Print order ${order.orderCode} (released at ${printer.name})`,
+            orderId: order.id,
+          }
+        });
+
+        // Update the order status to PAID and assign printer
+        await tx.order.update({
+          where: { id: order.id },
+          data: { printerId: printer.id, status: "PAID" },
+        });
+      });
     } catch (e: any) {
       if (e.message === "INSUFFICIENT_FUNDS") {
+        const user = await prisma.user.findUnique({ where: { id: req.user!.userId } });
         return res.status(402).json({
           error: "INSUFFICIENT_FUNDS",
           message: "Insufficient wallet balance. Please top up to print.",
           costPaise: order.costPaise,
-          walletBalancePaise: user.walletBalancePaise,
+          walletBalancePaise: user?.walletBalancePaise ?? 0,
           orderId: order.id,
           needTopup: true
         });
       }
       throw e;
     }
+  } else {
+    // If order was already PAID, just assign printer and update status
+    await prisma.order.update({
+      where: { id: order.id },
+      data: { printerId: printer.id, status: "PAID" },
+    });
   }
-
-  await prisma.order.update({
-    where: { id: order.id },
-    data: { printerId: printer.id, status: "PAID" },
-  });
   // Fire-and-forget: dispatch to printer in background so HTTP doesn't block/timeout
   dispatchToPrinter(order.id).catch((err) => {
     console.error("[orders] background print dispatch failed", err);

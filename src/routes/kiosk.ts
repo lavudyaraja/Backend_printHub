@@ -4,8 +4,33 @@
 import { Router } from "express";
 import { prisma } from "../lib/prisma";
 import { dispatchToPrinter } from "../services/printQueue";
+import { getObjectBuffer } from "../lib/storage";
 
 export const kioskRouter = Router();
+
+// Serve the print file directly (unauthenticated download for the IoT printer using the fileKey)
+kioskRouter.get("/download/:fileKey", async (req, res) => {
+  const { fileKey } = req.params;
+
+  // Find document to get original filename and type
+  const doc = await prisma.document.findFirst({
+    where: { fileKey, deleted: false }
+  });
+  if (!doc) return res.status(404).json({ error: "File not found" });
+
+  const buf = await getObjectBuffer(fileKey);
+  if (!buf) return res.status(404).json({ error: "File data not found" });
+
+  // Determine standard Content-Type based on extension or doc type
+  const ext = doc.fileName.split(".").pop()?.toLowerCase();
+  let contentType = "application/octet-stream";
+  if (ext === "pdf") contentType = "application/pdf";
+  else if (ext === "png") contentType = "image/png";
+  else if (ext === "jpg" || ext === "jpeg") contentType = "image/jpeg";
+  else if (ext === "docx") contentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+
+  res.type(contentType).send(buf);
+});
 
 // Validate an order by QR token or order code.
 kioskRouter.post("/validate", async (req, res) => {

@@ -75,13 +75,7 @@ try {
 startCleanup();
 startKioskMonitor();
 
-// Storage is required for uploads/printing — warn loudly if B2 isn't configured.
-if (!storageConfigured()) {
-  console.warn(
-    "[storage] ⚠ Backblaze B2 not configured — uploads & printing will fail. " +
-      "Set B2_ENDPOINT, B2_REGION, B2_BUCKET, B2_KEY_ID, B2_APP_KEY."
-  );
-}
+
 
 const PORT = Number(process.env.PORT || 4000);
 server.listen(PORT, () => console.log(`[printhub] backend on :${PORT}`));

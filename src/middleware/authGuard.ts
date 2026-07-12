@@ -6,12 +6,22 @@ export interface AuthedRequest extends Request {
 }
 
 export function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
+  let token = "";
   const header = req.headers.authorization;
-  if (!header?.startsWith("Bearer ")) {
+  if (header?.startsWith("Bearer ")) {
+    token = header.slice(7);
+  } else if (req.query.token) {
+    token = req.query.token as string;
+  }
+
+  console.log(`[authGuard] Path: ${req.path}, Query Token: ${req.query.token ? "Present" : "Missing"}, Header Token: ${header ? "Present" : "Missing"}, Final Token: ${token ? "Found" : "Not Found"}`);
+
+  if (!token) {
     return res.status(401).json({ error: "Unauthorized" });
   }
+
   try {
-    req.user = verifyToken(header.slice(7));
+    req.user = verifyToken(token);
     next();
   } catch {
     return res.status(401).json({ error: "Invalid token" });

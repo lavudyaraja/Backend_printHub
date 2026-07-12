@@ -10,12 +10,12 @@
  * B2 is NOT written during /upload — only when the user confirms their order.
  * If user abandons the configure screen, nothing is persisted.
  */
-import { Router }  from "express";
-import multer      from "multer";
-import { nanoid }  from "nanoid";
-import pdfParse    from "pdf-parse";
-import mammoth     from "mammoth";
-import { prisma }  from "../lib/prisma";
+import { Router } from "express";
+import multer from "multer";
+import { nanoid } from "nanoid";
+import pdfParse from "pdf-parse";
+import mammoth from "mammoth";
+import { prisma } from "../lib/prisma";
 import { requireAuth, AuthedRequest } from "../middleware/authGuard";
 import { renderPdfPageToPng } from "../lib/pdf";
 import { putObject, getObjectBuffer } from "../lib/storage";
@@ -24,10 +24,10 @@ export const documentsRouter = Router();
 
 // ── In-memory temp buffer store ───────────────────────────────────────────────
 interface TempEntry {
-  buffer:    Buffer;
-  mimeType:  string;
-  fileName:  string;
-  fileType:  string; // "pdf" | "docx" | "image"
+  buffer: Buffer;
+  mimeType: string;
+  fileName: string;
+  fileType: string; // "pdf" | "docx" | "image"
   pageCount: number;
   expiresAt: number; // epoch ms
 }
@@ -55,7 +55,7 @@ const upload = multer({
 const ALLOWED: Record<string, string> = {
   "application/pdf": "pdf",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
-  "image/png":  "image",
+  "image/png": "image",
   "image/jpeg": "image",
 };
 
@@ -81,9 +81,9 @@ documentsRouter.post(
     // Store in memory with TTL
     const tempKey = nanoid(20);
     tempBuffers.set(tempKey, {
-      buffer:    file.buffer,
-      mimeType:  file.mimetype,
-      fileName:  file.originalname,
+      buffer: file.buffer,
+      mimeType: file.mimetype,
+      fileName: file.originalname,
       fileType,
       pageCount,
       expiresAt: Date.now() + TEMP_TTL_MS,
@@ -93,7 +93,7 @@ documentsRouter.post(
 
     res.json({
       tempKey,
-      fileName:  file.originalname,
+      fileName: file.originalname,
       fileType,
       pageCount,
       sizeBytes: file.size,
@@ -121,7 +121,7 @@ documentsRouter.get("/preview/temp/:tempKey/:page", async (req, res) => {
   }
 
   const pageNum = Math.max(1, parseInt(page, 10) || 1);
-  const scale   = Math.min(2, Math.max(0.5, parseFloat((req.query.scale as string) || "1.2")));
+  const scale = Math.min(2, Math.max(0.5, parseFloat((req.query.scale as string) || "1.2")));
 
   try {
     const png = await renderPdfPageToPng(entry.buffer, pageNum, scale);
@@ -186,7 +186,7 @@ export async function commitTempFile(
   const entry = tempBuffers.get(tempKey);
   if (!entry) throw new Error("TEMP_EXPIRED");
 
-  const ext     = entry.fileName.split(".").pop() || "bin";
+  const ext = entry.fileName.split(".").pop() || "bin";
   const fileKey = `${nanoid()}.${ext}`;
 
   // Upload original file to B2
@@ -196,8 +196,8 @@ export async function commitTempFile(
   const doc = await prisma.document.create({
     data: {
       userId,
-      fileName:  entry.fileName,
-      fileType:  entry.fileType,
+      fileName: entry.fileName,
+      fileType: entry.fileType,
       fileKey,
       sizeBytes: entry.buffer.length,
       pageCount: entry.pageCount,
@@ -213,10 +213,15 @@ export async function commitTempFile(
 
 // ── GET /preview/:fileKey/:page — serve committed PDF pages from B2 ───────────
 // Used by IoT and order tracking screens after commit.
-documentsRouter.get("/preview/:fileKey/:page", async (req, res) => {
+documentsRouter.get("/preview/:fileKey/:page", requireAuth, async (req: AuthedRequest, res) => {
   const { fileKey, page } = req.params;
   const doc = await prisma.document.findFirst({ where: { fileKey, deleted: false } });
   if (!doc) return res.status(404).json({ error: "Document not found" });
+
+  // Security: verify that the user owns the document or is an admin
+  if (doc.userId !== req.user!.userId && req.user!.role !== "ADMIN") {
+    return res.status(403).json({ error: "Forbidden: You do not own this document" });
+  }
 
   if (doc.fileType === "image") {
     const buf = await getObjectBuffer(fileKey);
@@ -229,8 +234,8 @@ documentsRouter.get("/preview/:fileKey/:page", async (req, res) => {
     return res.status(400).json({ error: "Preview not supported for this file type" });
   }
 
-  const pageNum  = Math.max(1, parseInt(page, 10) || 1);
-  const scale    = Math.min(2, Math.max(0.5, parseFloat((req.query.scale as string) || "1.2")));
+  const pageNum = Math.max(1, parseInt(page, 10) || 1);
+  const scale = Math.min(2, Math.max(0.5, parseFloat((req.query.scale as string) || "1.2")));
   const cacheKey = `${fileKey}_page_${pageNum}_s${scale.toFixed(1)}.png`;
 
   let preview = await getObjectBuffer(cacheKey);
@@ -239,7 +244,7 @@ documentsRouter.get("/preview/:fileKey/:page", async (req, res) => {
     if (!pdfBuf) return res.status(404).json({ error: "File not found" });
     try {
       preview = await renderPdfPageToPng(pdfBuf, pageNum, scale);
-      putObject(cacheKey, preview, "image/png").catch(() => {});
+      putObject(cacheKey, preview, "image/png").catch(() => { });
     } catch {
       return res.status(404).json({ error: "Preview page not found" });
     }
@@ -248,9 +253,68 @@ documentsRouter.get("/preview/:fileKey/:page", async (req, res) => {
   res.type("image/png").set("Cache-Control", "public, max-age=3600").send(preview);
 });
 
+// ── GET /docx-preview/:fileKey — DOCX → HTML from B2 ─────────────────────────
+documentsRouter.get("/docx-preview/:fileKey", requireAuth, async (req: AuthedRequest, res) => {
+  const { fileKey } = req.params;
+  const doc = await prisma.document.findFirst({ where: { fileKey, deleted: false } });
+  if (!doc) return res.status(404).json({ error: "Document not found" });
+
+  // Security: verify that the user owns the document or is an admin
+  if (doc.userId !== req.user!.userId && req.user!.role !== "ADMIN") {
+    return res.status(403).json({ error: "Forbidden: You do not own this document" });
+  }
+
+  if (doc.fileType !== "docx") {
+    return res.status(400).json({ error: "Not a DOCX file" });
+  }
+
+  try {
+    const buf = await getObjectBuffer(fileKey);
+    if (!buf) return res.status(404).json({ error: "File not found" });
+
+    const { value: bodyHtml } = await mammoth.convertToHtml({ buffer: buf });
+    const page = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=2">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 14px; line-height: 1.7;
+         color: #1a1a1a; background: #fff; padding: 18px; }
+  h1,h2,h3,h4,h5,h6 { font-weight: 700; margin: 18px 0 8px; line-height: 1.3; }
+  h1 { font-size: 20px; } h2 { font-size: 17px; } h3 { font-size: 15px; }
+  p { margin-bottom: 10px; }
+  ul,ol { padding-left: 22px; margin-bottom: 10px; }
+  li { margin-bottom: 4px; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 14px; font-size: 13px; }
+  th,td { border: 1px solid #dde1e7; padding: 7px 10px; text-align: left; }
+  th { background: #f5f6fa; font-weight: 700; }
+  img { max-width: 100%; height: auto; border-radius: 4px; margin: 8px 0; }
+  strong,b { font-weight: 700; } em,i { font-style: italic; } u { text-decoration: underline; }
+</style>
+</head>
+<body>${bodyHtml}</body>
+</html>`;
+    res.type("text/html").send(page);
+  } catch (e) {
+    console.error("[docx-preview] failed", e);
+    res.status(500).json({ error: "DOCX conversion failed" });
+  }
+});
+
 // ── GET /file/:fileKey — download committed file ──────────────────────────────
-documentsRouter.get("/file/:fileKey", async (req, res) => {
-  const buf = await getObjectBuffer(req.params.fileKey);
+documentsRouter.get("/file/:fileKey", requireAuth, async (req: AuthedRequest, res) => {
+  const { fileKey } = req.params;
+  const doc = await prisma.document.findFirst({ where: { fileKey, deleted: false } });
+  if (!doc) return res.status(404).json({ error: "Document not found" });
+
+  // Security: verify that the user owns the document or is an admin
+  if (doc.userId !== req.user!.userId && req.user!.role !== "ADMIN") {
+    return res.status(403).json({ error: "Forbidden: You do not own this document" });
+  }
+
+  const buf = await getObjectBuffer(fileKey);
   if (!buf) return res.status(404).json({ error: "File not found" });
   res.send(buf);
 });
@@ -258,7 +322,7 @@ documentsRouter.get("/file/:fileKey", async (req, res) => {
 // ── GET / — list user's committed documents ───────────────────────────────────
 documentsRouter.get("/", requireAuth, async (req: AuthedRequest, res) => {
   const docs = await prisma.document.findMany({
-    where:   { userId: req.user!.userId, deleted: false },
+    where: { userId: req.user!.userId, deleted: false },
     orderBy: { createdAt: "desc" },
   });
   res.json({ documents: docs });

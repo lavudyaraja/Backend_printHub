@@ -1,7 +1,7 @@
 // MQTT bridge — backend <-> IoT print agents (Raspberry Pi).
 // Topics:
-//   printhub/printer/{deviceId}/job     -> backend publishes print job
-//   printhub/printer/{deviceId}/status  -> device publishes status/telemetry
+//   prinsta/printer/{deviceId}/job     -> backend publishes print job
+//   prinsta/printer/{deviceId}/status  -> device publishes status/telemetry
 import mqtt, { MqttClient } from "mqtt";
 import { prisma } from "./prisma";
 import { config } from "./config";
@@ -19,8 +19,8 @@ export function initMqtt(onJobUpdate: (payload: any) => void) {
 
   client.on("connect", () => {
     console.log("[mqtt] connected");
-    client.subscribe("printhub/printer/+/status");
-    client.subscribe("printhub/printer/+/job-result");
+    client.subscribe("prinsta/printer/+/status");
+    client.subscribe("prinsta/printer/+/job-result");
   });
   client.on("reconnect", () => console.log("[mqtt] reconnecting…"));
   client.on("offline", () => console.warn("[mqtt] offline"));
@@ -65,5 +65,5 @@ export function publishJob(deviceId: string, job: unknown) {
     console.warn("[mqtt] client not initialized — cannot publish job");
     return;
   }
-  client.publish(`printhub/printer/${deviceId}/job`, JSON.stringify(job), { qos: 1 });
+  client.publish(`prinsta/printer/${deviceId}/job`, JSON.stringify(job), { qos: 1 });
 }
