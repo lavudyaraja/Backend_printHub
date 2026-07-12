@@ -373,7 +373,10 @@ ordersRouter.post("/print-at", requireAuth, async (req: AuthedRequest, res) => {
     where: { id: order.id },
     data: { printerId: printer.id, status: "PAID" },
   });
-  await dispatchToPrinter(order.id);
+  // Fire-and-forget: dispatch to printer in background so HTTP doesn't block/timeout
+  dispatchToPrinter(order.id).catch((err) => {
+    console.error("[orders] background print dispatch failed", err);
+  });
 
   res.json({ ok: true, orderId: order.id, kiosk: printer.name });
 });

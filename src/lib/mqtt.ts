@@ -61,5 +61,9 @@ async function handleStatus(p: {
 
 // Push a print command to a specific device.
 export function publishJob(deviceId: string, job: unknown) {
+  if (!client) {
+    console.warn("[mqtt] client not initialized — cannot publish job");
+    return;
+  }
   client.publish(`printhub/printer/${deviceId}/job`, JSON.stringify(job), { qos: 1 });
 }
