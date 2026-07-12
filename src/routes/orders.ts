@@ -323,6 +323,51 @@ ordersRouter.post("/from-temp", requireAuth, async (req: AuthedRequest, res) => 
   res.json({ order, qrImage });
 });
 
+// Ecological statistics.
+ordersRouter.get("/eco-stats", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const completedOrders = await prisma.order.findMany({
+      where: { userId: req.user!.userId, status: "COMPLETED" },
+      select: { pagesToPrint: true, copies: true, sideMode: true, colorMode: true },
+    });
+
+    let sheetsSaved = 0;
+    let totalPrintedPages = 0;
+    let bwPagesPrinted = 0;
+
+    for (const o of completedOrders) {
+      const totalPages = o.pagesToPrint * o.copies;
+      totalPrintedPages += totalPages;
+      
+      if (o.sideMode === "DOUBLE") {
+        const sheetsUsedPerCopy = Math.ceil(o.pagesToPrint / 2);
+        const sheetsSavedPerCopy = o.pagesToPrint - sheetsUsedPerCopy;
+        sheetsSaved += sheetsSavedPerCopy * o.copies;
+      }
+      
+      if (o.colorMode === "BW") {
+        bwPagesPrinted += totalPages;
+      }
+    }
+
+    const paperSavedGrams = sheetsSaved * 5;
+    const co2SavedGrams = paperSavedGrams * 1.5;
+    const waterSavedLiters = sheetsSaved * 10;
+    const treesSaved = sheetsSaved / 8333;
+
+    res.json({
+      sheetsSaved,
+      co2SavedGrams,
+      waterSavedLiters,
+      treesSaved,
+      totalPrintedPages,
+      bwPagesPrinted
+    });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message || "Failed to load eco statistics" });
+  }
+});
+
 // Track single order.
 ordersRouter.get("/:id", requireAuth, async (req: AuthedRequest, res) => {
   const order = await prisma.order.findFirst({

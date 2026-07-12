@@ -173,6 +173,8 @@ model Printer {
   status      PrinterStatus @default(OFFLINE)
   paperLevel  Int           @default(100)   // %
   tonerLevel  Int           @default(100)   // %
+  latitude    Float?
+  longitude   Float?
   lastSeenAt  DateTime?
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt

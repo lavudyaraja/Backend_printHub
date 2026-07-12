@@ -17,6 +17,8 @@ printersRouter.get("/", requireAuth, async (_req, res) => {
       status: true,
       paperLevel: true,
       tonerLevel: true,
+      latitude: true,
+      longitude: true,
     },
   });
   res.json({ printers });
