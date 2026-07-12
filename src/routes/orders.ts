@@ -281,22 +281,9 @@ ordersRouter.post("/from-temp", requireAuth, async (req: AuthedRequest, res) => 
       costPaise,
       printToken,
       qrData,
-      status: "PAID",
+      status: "READY",
     },
   });
-
-  // 5. Optional wallet deduction
-  if (c.payWithWallet && costPaise > 0) {
-    try {
-      await debitWallet(order.userId, costPaise, `Print order ${order.orderCode}`, order.id);
-    } catch (e: any) {
-      await prisma.order.delete({ where: { id: order.id } });
-      if (e.message === "INSUFFICIENT_FUNDS") {
-        return res.status(402).json({ error: "Insufficient wallet balance. Please top up.", needTopup: true });
-      }
-      throw e;
-    }
-  }
 
   await createNotification(
     order.userId,
@@ -412,6 +399,39 @@ ordersRouter.post("/print-at", requireAuth, async (req: AuthedRequest, res) => {
   if (!order) return res.status(404).json({ error: "No order ready to print. Create one first." });
   if (!["PAID", "READY"].includes(order.status)) {
     return res.status(409).json({ error: `Order is already ${order.status.toLowerCase()}` });
+  }
+
+  // If order is unpaid (READY), debit user wallet now!
+  if (order.status === "READY") {
+    const user = await prisma.user.findUnique({ where: { id: req.user!.userId } });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    if (user.walletBalancePaise < order.costPaise) {
+      return res.status(402).json({
+        error: "INSUFFICIENT_FUNDS",
+        message: "Insufficient wallet balance. Please top up to print.",
+        costPaise: order.costPaise,
+        walletBalancePaise: user.walletBalancePaise,
+        orderId: order.id,
+        needTopup: true
+      });
+    }
+
+    try {
+      await debitWallet(order.userId, order.costPaise, `Print order ${order.orderCode} (released at ${printer.name})`, order.id);
+    } catch (e: any) {
+      if (e.message === "INSUFFICIENT_FUNDS") {
+        return res.status(402).json({
+          error: "INSUFFICIENT_FUNDS",
+          message: "Insufficient wallet balance. Please top up to print.",
+          costPaise: order.costPaise,
+          walletBalancePaise: user.walletBalancePaise,
+          orderId: order.id,
+          needTopup: true
+        });
+      }
+      throw e;
+    }
   }
 
   await prisma.order.update({
