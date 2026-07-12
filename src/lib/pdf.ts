@@ -30,3 +30,28 @@ export async function renderPdfPageToPng(
   );
   return Buffer.from(pixmap.asPNG());
 }
+
+// Render ALL (or first `maxPages`) pages in one document-open pass.
+// Returns PNG buffers indexed from 0 (page 1 = index 0).
+// maxPages: cap how many pages to render (undefined = all).
+export async function renderAllPdfPagesToPng(
+  pdfBuffer: Buffer,
+  scale = 1.2,
+  maxPages?: number
+): Promise<Buffer[]> {
+  const mupdf = await getMupdf();
+  const doc   = mupdf.Document.openDocument(pdfBuffer, "application/pdf");
+  const count = doc.countPages();
+  const limit = maxPages !== undefined ? Math.min(count, maxPages) : count;
+  const results: Buffer[] = [];
+  for (let i = 0; i < limit; i++) {
+    const page   = doc.loadPage(i);
+    const pixmap = page.toPixmap(
+      mupdf.Matrix.scale(scale, scale),
+      mupdf.ColorSpace.DeviceRGB,
+      false // white background (good for print preview)
+    );
+    results.push(Buffer.from(pixmap.asPNG()));
+  }
+  return results;
+}

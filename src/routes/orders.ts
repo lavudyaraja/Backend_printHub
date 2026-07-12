@@ -1,5 +1,4 @@
 // Orders: create order, preview page count, track, history.
-// Payment removed — all orders are auto-confirmed (free printing).
 import { Router } from "express";
 import { z } from "zod";
 import { nanoid } from "nanoid";
@@ -10,6 +9,7 @@ import { enqueuePrint, dispatchToPrinter } from "../services/printQueue";
 import { createNotification } from "../lib/notify";
 import { sendEmail, orderReceiptEmail } from "../lib/mailer";
 import { debitWallet } from "./wallet";
+import { commitTempFile } from "./documents";
 
 export const ordersRouter = Router();
 
@@ -214,6 +214,110 @@ ordersRouter.post("/", requireAuth, async (req: AuthedRequest, res) => {
   }
 
   // If a printer was pre-selected, enqueue immediately.
+  if (c.printerId) await enqueuePrint(order.id);
+
+  res.json({ order, qrImage });
+});
+
+// ── POST /from-temp — commit a temp file and create order in one step ─────────
+// This is the primary order-creation path when using the new temp-buffer upload.
+// body: { tempKey, colorMode, sideMode, copies, pageRange, pageColorModes, ... }
+const fromTempSchema = z.object({
+  tempKey:        z.string(),
+  colorMode:      z.enum(["BW", "COLOR"]).default("BW"),
+  sideMode:       z.enum(["SINGLE", "DOUBLE"]).default("SINGLE"),
+  copies:         z.number().int().min(1).max(50).default(1),
+  pageRange:      z.string().default("all"),
+  pageColorModes: z.string().optional(),
+  printerId:      z.string().optional(),
+  payWithWallet:  z.boolean().optional(),
+});
+
+ordersRouter.post("/from-temp", requireAuth, async (req: AuthedRequest, res) => {
+  const parsed = fromTempSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  const c = parsed.data;
+
+  // 1. Commit the temp file → B2 + Document DB record
+  let doc: Awaited<ReturnType<typeof commitTempFile>>;
+  try {
+    doc = await commitTempFile(c.tempKey, req.user!.userId);
+  } catch (e: any) {
+    if (e.message === "TEMP_EXPIRED") {
+      return res.status(410).json({ error: "SESSION_EXPIRED", message: "Your file preview has expired. Please re-upload the file." });
+    }
+    throw e;
+  }
+
+  // 2. Compute cost
+  const pagesToPrint = countPages(c.pageRange, doc.pageCount);
+  const costPaise    = calculateTotalCost(c.pageRange, c.pageColorModes, doc.pageCount, c.copies);
+
+  // 3. Determine overall color mode from per-page modes
+  let storedColorMode: "BW" | "COLOR" = c.colorMode;
+  if (c.pageColorModes) {
+    const hasSomeColor = c.pageColorModes.split(",").some((item) => item.split(":")[1] === "COLOR");
+    if (hasSomeColor) storedColorMode = "COLOR";
+  }
+
+  // 4. Create order
+  const orderCode = "PH-" + nanoid(6).toUpperCase();
+  const printToken = nanoid(40);
+  const qrData  = JSON.stringify({ code: orderCode, token: printToken });
+  const qrImage = await QRCode.toDataURL(qrData);
+
+  const order = await prisma.order.create({
+    data: {
+      orderCode,
+      userId:         req.user!.userId,
+      documentId:     doc.id,
+      printerId:      c.printerId,
+      colorMode:      storedColorMode,
+      sideMode:       c.sideMode,
+      copies:         c.copies,
+      pageRange:      c.pageRange,
+      pageColorModes: c.pageColorModes,
+      pagesToPrint,
+      costPaise,
+      printToken,
+      qrData,
+      status: "PAID",
+    },
+  });
+
+  // 5. Optional wallet deduction
+  if (c.payWithWallet && costPaise > 0) {
+    try {
+      await debitWallet(order.userId, costPaise, `Print order ${order.orderCode}`, order.id);
+    } catch (e: any) {
+      await prisma.order.delete({ where: { id: order.id } });
+      if (e.message === "INSUFFICIENT_FUNDS") {
+        return res.status(402).json({ error: "Insufficient wallet balance. Please top up.", needTopup: true });
+      }
+      throw e;
+    }
+  }
+
+  await createNotification(
+    order.userId,
+    "Order placed",
+    `Order ${order.orderCode} created — scan your QR at any kiosk to print.`,
+    order.id
+  );
+
+  const buyer = await prisma.user.findUnique({ where: { id: order.userId } });
+  if (buyer?.email) {
+    const { subject, html } = orderReceiptEmail({
+      name:         buyer.name,
+      orderCode:    order.orderCode,
+      pages:        order.pagesToPrint,
+      copies:       order.copies,
+      colorMode:    order.colorMode,
+      amountPaise:  order.costPaise ?? 0,
+    });
+    sendEmail(buyer.email, subject, html);
+  }
+
   if (c.printerId) await enqueuePrint(order.id);
 
   res.json({ order, qrImage });
