@@ -110,22 +110,33 @@ authRouter.post("/google", async (req, res) => {
     return res.status(400).json({ error: "Missing Google credential or user info" });
   }
 
+  // ── 1. Verify the token with Google. Only this step may answer 401. ────────
+  let email: string;
+  let googleId: string;
+  let name: string;
   try {
-    // Verify the access token is valid and belongs to our app
     const tokenCheck = await fetch(
-      `https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=${credential}`
+      `https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=${encodeURIComponent(credential)}`
     );
     if (!tokenCheck.ok) {
-      return res.status(401).json({ error: "Invalid Google access token" });
+      return res.status(401).json({ error: "Invalid or expired Google sign-in. Please try again." });
     }
-    const tokenData = await tokenCheck.json() as { email?: string; sub?: string };
+    const tokenData = (await tokenCheck.json()) as { email?: string; sub?: string };
 
-    const email = (tokenData.email || userInfo.email).toLowerCase();
-    const googleId = tokenData.sub || userInfo.sub;
-    const name = userInfo.name || email.split("@")[0];
+    email = (tokenData.email || userInfo.email).toLowerCase();
+    googleId = tokenData.sub || userInfo.sub;
+    name = userInfo.name || email.split("@")[0];
 
-    if (!googleId) return res.status(400).json({ error: "Could not verify Google identity" });
+    if (!googleId) return res.status(401).json({ error: "Could not verify your Google identity." });
+  } catch (e: any) {
+    console.error("[google-auth] token verification failed:", e?.message);
+    return res.status(401).json({ error: "Could not reach Google to verify your sign-in." });
+  }
 
+  // ── 2. Look the user up / create them. Failures here are SERVER errors (500),
+  //       not auth failures — masking them as 401 hides real bugs (e.g. a DB
+  //       schema that is out of sync with the Prisma client).
+  try {
     let user = await prisma.user.findFirst({
       where: { OR: [{ googleId }, { email }] },
     });
@@ -147,8 +158,8 @@ authRouter.post("/google", async (req, res) => {
     const token = signToken({ userId: user.id, role: user.role });
     res.json({ token, user: safeUser(user) });
   } catch (e: any) {
-    console.error("[google-auth]", e.message);
-    res.status(401).json({ error: "Google authentication failed" });
+    console.error("[google-auth] account lookup/create failed:", e);
+    res.status(500).json({ error: "Sign-in failed on our side. Please try again shortly." });
   }
 });
 
