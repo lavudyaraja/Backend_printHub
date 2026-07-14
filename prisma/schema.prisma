@@ -197,6 +197,7 @@ model Printer {
   serialNumber   String?
   ipAddress      String
   macAddress     String?
+  accessPassword String?       // printer WiFi/admin password — admin-only, never exposed to end users
 
   // Status
   status         PrinterStatus @default(OFFLINE)

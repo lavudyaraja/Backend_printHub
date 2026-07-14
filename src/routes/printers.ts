@@ -29,6 +29,7 @@ const printerSchema = z.object({
   serialNumber: z.string().optional(),
   ipAddress: z.string().min(7),
   macAddress: z.string().optional(),
+  accessPassword: z.string().optional(),
   locationName: z.string().min(2),
   shopName: z.string().min(2),
   ownerName: z.string().min(2),
@@ -123,7 +124,9 @@ printersRouter.get("/:id", requireAuth, async (req, res) => {
     },
   });
   if (!printer) return res.status(404).json({ error: "Printer not found" });
-  res.json({ printer });
+  // Never expose the printer access password in API responses.
+  const { accessPassword, ...safe } = printer as typeof printer & { accessPassword?: string | null };
+  res.json({ printer: safe });
 });
 
 // ── Register printer (admin only) ─────────────────────────────────────────────
@@ -146,6 +149,7 @@ printersRouter.post("/", requireAuth, requireRole("ADMIN"), async (req, res) => 
       serialNumber: data.serialNumber || null,
       ipAddress: data.ipAddress,
       macAddress: data.macAddress || null,
+      accessPassword: data.accessPassword || null,
       locationName: data.locationName,
       shopName: data.shopName,
       ownerName: data.ownerName,
@@ -183,6 +187,7 @@ printersRouter.put("/:id", requireAuth, requireRole("ADMIN"), async (req, res) =
         ...(data.serialNumber !== undefined ? { serialNumber: data.serialNumber } : {}),
         ...(data.ipAddress !== undefined ? { ipAddress: data.ipAddress } : {}),
         ...(data.macAddress !== undefined ? { macAddress: data.macAddress } : {}),
+        ...(data.accessPassword !== undefined ? { accessPassword: data.accessPassword || null } : {}),
         ...(data.locationName !== undefined ? { locationName: data.locationName } : {}),
         ...(data.shopName !== undefined ? { shopName: data.shopName } : {}),
         ...(data.ownerName !== undefined ? { ownerName: data.ownerName } : {}),
