@@ -1,36 +1,32 @@
-// Temporary storage sweeper: any uploaded file (+ its cached preview pages) that
-// was never printed is deleted from Backblaze B2 after a short TTL. Nothing is
-// retained long-term (privacy). Runs every 30s.
+// Temp-file sweeper. Documents live in Neon only as a short-lived buffer:
+//   • uploads with no order after 2h are deleted, and
+//   • file bytes are cleared once their order is COMPLETED (keep the metadata).
+// Nothing is retained long-term (privacy + DB size).
 import { prisma } from "./prisma";
-import { deleteFileAndPreviews, storageConfigured } from "./storage";
 
-const TTL_MS = 10 * 60 * 1000; // 10 minutes — enough to reach a kiosk and print
+const STALE_MS = 2 * 60 * 60 * 1000; // 2 hours
+const SWEEP_MS = 30 * 60 * 1000;     // every 30 min
 
 async function sweep() {
-  if (!storageConfigured()) return;
-  const cutoff = new Date(Date.now() - TTL_MS);
-  const stale = await prisma.document.findMany({
-    where: {
-      deleted: false,
-      createdAt: { lt: cutoff },
-      OR: [
-        { order: null },
-        { order: { status: { in: ["COMPLETED", "FAILED", "CANCELLED"] } } }
-      ]
-    },
+  const cutoff = new Date(Date.now() - STALE_MS);
+
+  // 1) Orphan uploads (never turned into an order) → delete.
+  const orphans = await prisma.document.deleteMany({
+    where: { createdAt: { lt: cutoff }, order: null, deleted: false },
   });
-  for (const doc of stale) {
-    try {
-      await deleteFileAndPreviews(doc.fileKey);
-    } catch (e) {
-      console.error("[cleanup] failed to remove", doc.fileKey, e);
-    }
-    await prisma.document.update({ where: { id: doc.id }, data: { deleted: true } });
+
+  // 2) Completed orders → drop the stored bytes, keep the record.
+  const done = await prisma.document.updateMany({
+    where: { deleted: false, fileData: { not: null }, order: { status: "COMPLETED" } },
+    data: { fileData: null, deleted: true },
+  });
+
+  if (orphans.count || done.count) {
+    console.log(`[cleanup] removed ${orphans.count} orphan upload(s), cleared ${done.count} completed file(s)`);
   }
-  if (stale.length) console.log(`[cleanup] removed ${stale.length} expired file(s) from B2`);
 }
 
 export function startCleanup() {
-  setInterval(() => sweep().catch((e) => console.error("[cleanup]", e)), 30_000);
-  console.log("[cleanup] temporary-file sweeper started (10 min TTL, B2)");
+  setInterval(() => sweep().catch((e) => console.error("[cleanup]", e)), SWEEP_MS);
+  console.log("[cleanup] temp-file sweeper started (2h orphan TTL)");
 }

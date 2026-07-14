@@ -5,12 +5,12 @@
 //
 // Env:
 //   BREVO_API_KEY   your Brevo v3 API key (starts with "xkeysib-")
-//   MAIL_FROM       sender, e.g. "Prinsta <no-reply@yourdomain.com>"
+//   MAIL_FROM       sender, e.g. "PrintHub <no-reply@yourdomain.com>"
 
 function parseFrom(): { email: string; name: string } {
-  const raw = process.env.MAIL_FROM || "Prinsta <no-reply@prinsta.app>";
+  const raw = process.env.MAIL_FROM || "PrintHub <no-reply@printhub.app>";
   const m = raw.match(/^(.*?)\s*<(.+?)>$/);
-  return m ? { name: m[1].trim() || "Prinsta", email: m[2].trim() } : { name: "Prinsta", email: raw.trim() };
+  return m ? { name: m[1].trim() || "PrintHub", email: m[2].trim() } : { name: "PrintHub", email: raw.trim() };
 }
 
 export function mailConfigured() {
@@ -46,10 +46,10 @@ const BRAND = "#6D4AFF";
 function shell(inner: string) {
   return `<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#F5F4FB;padding:24px">
   <div style="max-width:460px;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #ECECF1">
-    <div style="background:${BRAND};padding:20px 24px"><span style="color:#fff;font-size:20px;font-weight:800">Prinsta</span></div>
+    <div style="background:${BRAND};padding:20px 24px"><span style="color:#fff;font-size:20px;font-weight:800">PrintHub</span></div>
     <div style="padding:24px">${inner}</div>
     <div style="padding:16px 24px;border-top:1px solid #F0F0F4;color:#9090A0;font-size:12px">
-      You received this email from Prinsta. If this wasn't you, please ignore it.
+      You received this email from PrintHub. If this wasn't you, please ignore it.
     </div>
   </div>
 </div>`;
@@ -62,25 +62,25 @@ export function otpEmail(code: string, purpose: "login" | "reset" = "login") {
     <h2 style="margin:0 0 8px;color:#111114;font-size:20px">${heading}</h2>
     <p style="color:#4A4A5A;font-size:14px;line-height:21px;margin:0 0 18px">Use this one-time code to continue. It expires in ${mins} minutes.</p>
     <div style="background:#F5F4FB;border-radius:12px;text-align:center;padding:18px;font-size:30px;font-weight:800;letter-spacing:8px;color:${BRAND}">${code}</div>
-    <p style="color:#9090A0;font-size:12px;margin:18px 0 0">Never share this code with anyone. Prinsta will never ask for it.</p>`);
-  return { subject: `${code} is your Prinsta ${purpose === "reset" ? "password reset" : "login"} code`, html };
+    <p style="color:#9090A0;font-size:12px;margin:18px 0 0">Never share this code with anyone. PrintHub will never ask for it.</p>`);
+  return { subject: `${code} is your PrintHub ${purpose === "reset" ? "password reset" : "login"} code`, html };
 }
 
 export function loginAlertEmail(name: string) {
   const when = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "medium", timeStyle: "short" });
   const html = shell(`
-    <h2 style="margin:0 0 8px;color:#111114;font-size:20px">You logged in to Prinsta</h2>
-    <p style="color:#4A4A5A;font-size:14px;line-height:21px;margin:0 0 12px">Hi ${name}, your Prinsta account was just signed in.</p>
+    <h2 style="margin:0 0 8px;color:#111114;font-size:20px">You logged in to PrintHub</h2>
+    <p style="color:#4A4A5A;font-size:14px;line-height:21px;margin:0 0 12px">Hi ${name}, your PrintHub account was just signed in.</p>
     <div style="background:#F5F4FB;border-radius:12px;padding:14px;color:#4A4A5A;font-size:13px">Time: <b>${when} IST</b></div>
     <p style="color:#9090A0;font-size:12px;margin:16px 0 0">If this was you, no action is needed. If you didn't sign in, please reset your password immediately.</p>`);
-  return { subject: "New login to your Prinsta account", html };
+  return { subject: "New login to your PrintHub account", html };
 }
 
 export function welcomeEmail(name: string) {
   const html = shell(`
     <h2 style="margin:0 0 8px;color:#111114;font-size:20px">Welcome, ${name}! 🎉</h2>
-    <p style="color:#4A4A5A;font-size:14px;line-height:21px">Your Prinsta account is ready. Upload a document, choose your print options, and collect your prints at any kiosk.</p>`);
-  return { subject: "Welcome to Prinsta", html };
+    <p style="color:#4A4A5A;font-size:14px;line-height:21px">Your PrintHub account is ready. Upload a document, choose your print options, and collect your prints at any kiosk.</p>`);
+  return { subject: "Welcome to PrintHub", html };
 }
 
 export function orderReceiptEmail(opts: {
@@ -100,5 +100,5 @@ export function orderReceiptEmail(opts: {
       ${row("Amount", "₹" + amount)}
     </table>
     <p style="color:#9090A0;font-size:12px;margin:18px 0 0">Scan your QR at any kiosk to collect your prints.</p>`);
-  return { subject: `Order #${opts.orderCode} confirmed — Prinsta`, html };
+  return { subject: `Order #${opts.orderCode} confirmed — PrintHub`, html };
 }

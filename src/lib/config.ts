@@ -24,10 +24,24 @@ export const config = {
   jwtSecret: required("JWT_SECRET") || "dev_secret",
   adminSignupCode: process.env.ADMIN_SIGNUP_CODE || "PRINTHUB-ADMIN-2026",
   databaseUrl: required("DATABASE_URL"),
-  mqttUrl: process.env.MQTT_URL || "mqtt://localhost:1883",
   backendUrl: process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 4000}`,
   // Comma-separated allowed origins for CORS (admin dashboard, etc). "*" allows all.
   corsOrigins: (process.env.CORS_ORIGINS || "*").split(",").map((s) => s.trim()),
+
+  // Razorpay — start in TEST mode (rzp_test_… keys). Flip the keys to live later.
+  razorpay: {
+    keyId: process.env.RAZORPAY_KEY_ID || "",
+    keySecret: process.env.RAZORPAY_KEY_SECRET || "",
+    get configured() {
+      return !!(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
+    },
+    get mode() {
+      return (process.env.RAZORPAY_KEY_ID || "").startsWith("rzp_live_") ? "live" : "test";
+    },
+  },
+
+  // Upload limits
+  maxUploadBytes: Number(process.env.MAX_UPLOAD_BYTES || 50 * 1024 * 1024), // 50 MB
 };
 
 // Validate at import time so the app refuses to boot with unsafe prod config.

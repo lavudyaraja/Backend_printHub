@@ -1,13 +1,13 @@
-// Auth: mobile-number + password. Register, login, forgot/reset password, OTP login.
-// OTP + reset codes are stored in-memory and (in dev) returned in the response.
-// For production, send the code via an SMS provider (MSG91/Twilio) instead.
 import { Router } from "express";
 import { z } from "zod";
 import bcrypt from "bcryptjs";
+import { OAuth2Client } from "google-auth-library";
 import { prisma } from "../lib/prisma";
 import { signToken } from "../lib/auth";
 import { requireAuth, AuthedRequest } from "../middleware/authGuard";
 import { sendEmail, otpEmail, welcomeEmail, loginAlertEmail } from "../lib/mailer";
+
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 export const authRouter = Router();
 
@@ -77,44 +77,109 @@ authRouter.post("/register", async (req, res) => {
   res.json({ token, user: safeUser(user) });
 });
 
-// ── Register admin/operator (requires the admin signup code) ───────
-const ADMIN_CODE = process.env.ADMIN_SIGNUP_CODE || "PRINTHUB-ADMIN-2026";
+// ── Register admin (email + password; no phone or code required) ───
 const adminRegisterSchema = z.object({
   name: z.string().min(2, "Enter your full name"),
-  phone,
-  email: emailOpt,
+  email: z.string().email("Enter a valid email").transform((e) => e.trim().toLowerCase()),
   password,
-  adminCode: z.string(),
 });
 
 authRouter.post("/register-admin", async (req, res) => {
   const parsed = adminRegisterSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: firstError(parsed.error) });
-  const { name, phone: ph, email, password: pw, adminCode } = parsed.data;
+  const { name, email, password: pw } = parsed.data;
 
-  if (adminCode !== ADMIN_CODE) {
-    return res.status(403).json({ error: "Invalid admin signup code" });
-  }
-  const existing = await prisma.user.findUnique({ where: { phone: ph } });
-  if (existing) return res.status(409).json({ error: "This mobile number is already registered" });
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (existing) return res.status(409).json({ error: "This email is already registered" });
 
   const passwordHash = await bcrypt.hash(pw, 10);
   const user = await prisma.user.create({
-    data: { name, phone: ph, email: email || null, passwordHash, role: "ADMIN" },
+    data: { name, email, passwordHash, role: "ADMIN" },
   });
   const token = signToken({ userId: user.id, role: user.role });
   res.json({ token, user: safeUser(user) });
 });
 
-// ── Login (phone + password) ───────────────────────────────────────
-authRouter.post("/login", async (req, res) => {
-  const parsed = z.object({ phone, password: z.string().min(1) }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "Invalid mobile number or password" });
-  const { phone: ph, password: pw } = parsed.data;
+// ── Google OAuth login / register (admin console) ──────────────────
+// The frontend uses useGoogleLogin (access-token flow), fetches userInfo
+// from Google's userinfo endpoint, and sends both here. We re-verify the
+// access token against Google's tokeninfo endpoint before trusting the payload.
+authRouter.post("/google", async (req, res) => {
+  const { credential, userInfo } = req.body;
+  if (!credential || !userInfo?.email) {
+    return res.status(400).json({ error: "Missing Google credential or user info" });
+  }
 
-  const user = await prisma.user.findUnique({ where: { phone: ph } });
+  try {
+    // Verify the access token is valid and belongs to our app
+    const tokenCheck = await fetch(
+      `https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=${credential}`
+    );
+    if (!tokenCheck.ok) {
+      return res.status(401).json({ error: "Invalid Google access token" });
+    }
+    const tokenData = await tokenCheck.json() as { email?: string; sub?: string };
+
+    const email = (tokenData.email || userInfo.email).toLowerCase();
+    const googleId = tokenData.sub || userInfo.sub;
+    const name = userInfo.name || email.split("@")[0];
+
+    if (!googleId) return res.status(400).json({ error: "Could not verify Google identity" });
+
+    let user = await prisma.user.findFirst({
+      where: { OR: [{ googleId }, { email }] },
+    });
+
+    if (user) {
+      if (!user.googleId) {
+        user = await prisma.user.update({ where: { id: user.id }, data: { googleId } });
+      }
+      if (user.role !== "ADMIN" && user.role !== "OPERATOR") {
+        return res.status(403).json({ error: "Access denied. An admin account is required." });
+      }
+    } else {
+      // First Google sign-in → create admin account automatically
+      user = await prisma.user.create({
+        data: { name, email, googleId, role: "ADMIN" },
+      });
+    }
+
+    const token = signToken({ userId: user.id, role: user.role });
+    res.json({ token, user: safeUser(user) });
+  } catch (e: any) {
+    console.error("[google-auth]", e.message);
+    res.status(401).json({ error: "Google authentication failed" });
+  }
+});
+
+// ── Login (phone OR email + password) ──────────────────────────────
+// Mobile app signs in with `phone`; the admin console signs in with
+// `email`. Either identifier is accepted so both clients share this route.
+const loginSchema = z
+  .object({
+    phone: z.string().optional(),
+    email: z.string().optional(),
+    password: z.string().min(1),
+  })
+  .refine((d) => !!(d.phone || d.email), "Enter your mobile number or email");
+
+authRouter.post("/login", async (req, res) => {
+  const parsed = loginSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid credentials" });
+  const { phone: rawPhone, email: rawEmail, password: pw } = parsed.data;
+
+  // Look up by whichever identifier was supplied.
+  let user = null;
+  if (rawPhone) {
+    const ph = rawPhone.replace(/\D/g, "");
+    user = await prisma.user.findUnique({ where: { phone: ph } });
+  } else if (rawEmail) {
+    const em = rawEmail.trim().toLowerCase();
+    user = await prisma.user.findUnique({ where: { email: em } });
+  }
+
   if (!user || !user.passwordHash) {
-    return res.status(401).json({ error: "Invalid mobile number or password" });
+    return res.status(401).json({ error: "Invalid credentials" });
   }
   const ok = await bcrypt.compare(pw, user.passwordHash);
   if (!ok) return res.status(401).json({ error: "Invalid mobile number or password" });

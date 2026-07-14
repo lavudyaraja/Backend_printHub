@@ -1,100 +1,320 @@
-// Admin dashboard API: metrics, orders, kiosks (paper/toner + low alerts).
+// Prinsta Admin API: stats, revenue, orders, users, support tickets, settings
 import { Router } from "express";
+import { z } from "zod";
+import bcrypt from "bcryptjs";
 import { prisma } from "../lib/prisma";
-import { requireAuth, requireRole } from "../middleware/authGuard";
+import { requireAuth, requireRole, type AuthedRequest } from "../middleware/authGuard";
+import { readSettings, writeSettings, maskSecrets } from "../lib/settings";
 
 export const adminRouter = Router();
 adminRouter.use(requireAuth, requireRole("ADMIN"));
 
-const LOW_PAPER = 20; // % threshold that flags a kiosk as needing a refill
+const LOW_PAPER = 20;
 
+// ── Dashboard metrics ──────────────────────────────────────────────────────────
 adminRouter.get("/metrics", async (_req, res) => {
-  const startOfDay = new Date(new Date().setHours(0, 0, 0, 0));
+  const now = new Date();
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const endOfLastMonth = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59);
 
-  const [totalOrders, completed, failed, users, dailyOrders, revenueAgg, pagesAgg, printers] =
-    await Promise.all([
-      prisma.order.count(),
-      prisma.order.count({ where: { status: "COMPLETED" } }),
-      prisma.order.count({ where: { status: "FAILED" } }),
-      prisma.user.count({ where: { role: "STUDENT" } }),
-      prisma.order.count({ where: { createdAt: { gte: startOfDay } } }),
-      // Revenue = value of completed prints.
-      prisma.order.aggregate({ _sum: { costPaise: true }, where: { status: "COMPLETED" } }),
-      prisma.order.aggregate({ _sum: { pagesToPrint: true }, where: { status: "COMPLETED" } }),
-      prisma.printer.findMany(),
-    ]);
+  const [
+    totalOrders, completedOrders, failedOrders, cancelledOrders,
+    dailyOrders, monthlyOrders, lastMonthOrders,
+    totalUsers, newUsersToday,
+    revenueAll, revenueMonth, revenueLastMonth,
+    pagesAll, printers,
+    walletStats,
+  ] = await Promise.all([
+    prisma.order.count(),
+    prisma.order.count({ where: { status: "COMPLETED" } }),
+    prisma.order.count({ where: { status: "FAILED" } }),
+    prisma.order.count({ where: { status: "CANCELLED" } }),
+    prisma.order.count({ where: { createdAt: { gte: startOfDay } } }),
+    prisma.order.count({ where: { createdAt: { gte: startOfMonth } } }),
+    prisma.order.count({ where: { createdAt: { gte: startOfLastMonth, lte: endOfLastMonth } } }),
+    prisma.user.count({ where: { role: "STUDENT" } }),
+    prisma.user.count({ where: { createdAt: { gte: startOfDay } } }),
+    prisma.order.aggregate({ _sum: { costPaise: true }, where: { status: "COMPLETED" } }),
+    prisma.order.aggregate({ _sum: { costPaise: true }, where: { status: "COMPLETED", createdAt: { gte: startOfMonth } } }),
+    prisma.order.aggregate({ _sum: { costPaise: true }, where: { status: "COMPLETED", createdAt: { gte: startOfLastMonth, lte: endOfLastMonth } } }),
+    prisma.order.aggregate({ _sum: { pagesToPrint: true }, where: { status: "COMPLETED" } }),
+    prisma.printer.findMany({ select: { id: true, status: true, paperLevel: true, tonerLevel: true } }),
+    prisma.walletTransaction.aggregate({ _sum: { amountPaise: true }, where: { type: "CREDIT" } }),
+  ]);
 
-  const lowPaperKiosks = printers.filter((p) => p.paperLevel <= LOW_PAPER);
+  const thisMonthRevenue = revenueMonth._sum.costPaise || 0;
+  const lastMonthRevenue = revenueLastMonth._sum.costPaise || 0;
+  const revenueGrowth = lastMonthRevenue === 0 ? 100 : Math.round(((thisMonthRevenue - lastMonthRevenue) / lastMonthRevenue) * 100);
+
+  const orderGrowth = lastMonthOrders === 0 ? 100 : Math.round(((monthlyOrders - lastMonthOrders) / lastMonthOrders) * 100);
 
   res.json({
     totalOrders,
-    completedPrints: completed,
-    failedJobs: failed,
-    totalUsers: users,
+    completedOrders,
+    failedOrders,
+    cancelledOrders,
     dailyOrders,
-    totalRevenuePaise: revenueAgg._sum.costPaise || 0,
-    totalPagesPrinted: pagesAgg._sum.pagesToPrint || 0,
-    totalKiosks: printers.length,
-    activeKiosks: printers.filter((p) => p.status === "ONLINE").length,
-    lowPaperCount: lowPaperKiosks.length,
+    monthlyOrders,
+    orderGrowth,
+    totalUsers,
+    newUsersToday,
+    totalRevenuePaise: revenueAll._sum.costPaise || 0,
+    monthlyRevenuePaise: thisMonthRevenue,
+    revenueGrowth,
+    totalPagesPrinted: pagesAll._sum.pagesToPrint || 0,
+    totalPrinters: printers.length,
+    activePrinters: printers.filter((p) => p.status === "ONLINE").length,
+    offlinePrinters: printers.filter((p) => p.status === "OFFLINE").length,
+    lowPaperCount: printers.filter((p) => p.paperLevel <= LOW_PAPER).length,
+    walletTopupPaise: walletStats._sum.amountPaise || 0,
   });
 });
 
-adminRouter.get("/orders", async (_req, res) => {
+// ── Revenue analytics (last 30 days by day) ───────────────────────────────────
+adminRouter.get("/revenue", async (req, res) => {
+  const { period = "30d" } = req.query as { period?: string };
+  const days = period === "7d" ? 7 : period === "90d" ? 90 : 30;
+
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+  since.setHours(0, 0, 0, 0);
+
+  // Get completed orders grouped by day
   const orders = await prisma.order.findMany({
-    orderBy: { createdAt: "desc" },
-    take: 200,
-    include: {
-      user: { select: { name: true, phone: true } },
-      document: { select: { fileName: true } },
-      printer: { select: { name: true } },
-    },
+    where: { status: "COMPLETED", createdAt: { gte: since } },
+    select: { createdAt: true, costPaise: true, pagesToPrint: true, colorMode: true },
+    orderBy: { createdAt: "asc" },
   });
-  res.json({ orders });
+
+  // Group by date
+  const dayMap = new Map<string, { date: string; revenuePaise: number; orders: number; pages: number; bwOrders: number; colorOrders: number }>();
+  for (let i = 0; i < days; i++) {
+    const d = new Date(since);
+    d.setDate(d.getDate() + i);
+    const key = d.toISOString().split("T")[0];
+    dayMap.set(key, { date: key, revenuePaise: 0, orders: 0, pages: 0, bwOrders: 0, colorOrders: 0 });
+  }
+
+  for (const o of orders) {
+    const key = o.createdAt.toISOString().split("T")[0];
+    const entry = dayMap.get(key);
+    if (entry) {
+      entry.revenuePaise += o.costPaise;
+      entry.orders += 1;
+      entry.pages += o.pagesToPrint;
+      if (o.colorMode === "COLOR") entry.colorOrders += 1;
+      else entry.bwOrders += 1;
+    }
+  }
+
+  // Top printers by revenue
+  const topPrinters = await prisma.order.groupBy({
+    by: ["printerId"],
+    where: { status: "COMPLETED", createdAt: { gte: since }, printerId: { not: null } },
+    _sum: { costPaise: true },
+    _count: { id: true },
+    orderBy: { _sum: { costPaise: "desc" } },
+    take: 5,
+  });
+
+  const printerIds = topPrinters.map((p) => p.printerId).filter(Boolean) as string[];
+  const printerNames = await prisma.printer.findMany({
+    where: { id: { in: printerIds } },
+    select: { id: true, name: true, shopName: true },
+  });
+  const nameMap = Object.fromEntries(printerNames.map((p) => [p.id, `${p.name} (${p.shopName})`]));
+
+  res.json({
+    chartData: Array.from(dayMap.values()),
+    topPrinters: topPrinters.map((p) => ({
+      printerId: p.printerId,
+      name: p.printerId ? nameMap[p.printerId] || "Unknown" : "Unassigned",
+      revenuePaise: p._sum.costPaise || 0,
+      orders: p._count.id,
+    })),
+  });
 });
 
-// Kiosks with paper/toner levels + low-paper alert flag.
+// ── Orders list ────────────────────────────────────────────────────────────────
+adminRouter.get("/orders", async (req, res) => {
+  const { status, search, limit = "50", offset = "0" } = req.query as Record<string, string>;
+
+  const where: any = {};
+  if (status) where.status = status;
+  if (search) {
+    where.OR = [
+      { orderCode: { contains: search, mode: "insensitive" } },
+      { user: { name: { contains: search, mode: "insensitive" } } },
+      { user: { phone: { contains: search } } },
+    ];
+  }
+
+  const [orders, total] = await Promise.all([
+    prisma.order.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: Math.min(parseInt(limit) || 50, 200),
+      skip: parseInt(offset) || 0,
+      include: {
+        user: { select: { name: true, phone: true, email: true } },
+        document: { select: { fileName: true, pageCount: true } },
+        printer: { select: { name: true, shopName: true, uniquePrinterId: true } },
+      },
+    }),
+    prisma.order.count({ where }),
+  ]);
+
+  res.json({ orders, total });
+});
+
+// ── Users list ─────────────────────────────────────────────────────────────────
+adminRouter.get("/users", async (req, res) => {
+  const { search, role, limit = "50", offset = "0" } = req.query as Record<string, string>;
+
+  const where: any = {};
+  if (role) where.role = role;
+  if (search) {
+    where.OR = [
+      { name: { contains: search, mode: "insensitive" } },
+      { phone: { contains: search } },
+      { email: { contains: search, mode: "insensitive" } },
+    ];
+  }
+
+  const [users, total] = await Promise.all([
+    prisma.user.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: Math.min(parseInt(limit) || 50, 200),
+      skip: parseInt(offset) || 0,
+      select: {
+        id: true, name: true, phone: true, email: true,
+        role: true, walletBalancePaise: true, createdAt: true,
+        _count: { select: { orders: true } },
+      },
+    }),
+    prisma.user.count({ where }),
+  ]);
+
+  res.json({ users, total });
+});
+
+// ── Wallet / transactions ──────────────────────────────────────────────────────
+adminRouter.get("/transactions", async (req, res) => {
+  const { type, search, limit = "50", offset = "0" } = req.query as Record<string, string>;
+
+  const where: any = {};
+  if (type) where.type = type;
+  if (search) {
+    where.OR = [
+      { user: { name: { contains: search, mode: "insensitive" } } },
+      { description: { contains: search, mode: "insensitive" } },
+    ];
+  }
+
+  const [txns, total] = await Promise.all([
+    prisma.walletTransaction.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: Math.min(parseInt(limit) || 50, 200),
+      skip: parseInt(offset) || 0,
+      include: { user: { select: { name: true, phone: true } } },
+    }),
+    prisma.walletTransaction.count({ where }),
+  ]);
+
+  res.json({ transactions: txns, total });
+});
+
+// ── Printers with low-resource alerts ─────────────────────────────────────────
 adminRouter.get("/kiosks", async (_req, res) => {
-  const printers = await prisma.printer.findMany({ orderBy: { location: "asc" } });
+  const printers = await prisma.printer.findMany({ orderBy: { shopName: "asc" } });
   res.json({
     kiosks: printers.map((p) => ({
-      id: p.id,
-      name: p.name,
-      location: p.location,
-      deviceId: p.deviceId,
-      status: p.status,
-      paperLevel: p.paperLevel,
-      tonerLevel: p.tonerLevel,
-      lastSeenAt: p.lastSeenAt,
+      ...p,
       needsPaper: p.paperLevel <= LOW_PAPER,
       needsToner: p.tonerLevel <= LOW_PAPER,
     })),
   });
 });
 
-// Refill / update a kiosk's paper & toner (operator marks it topped up).
 adminRouter.patch("/kiosks/:id", async (req, res) => {
-  const { paperLevel, tonerLevel, status } = req.body as {
-    paperLevel?: number;
-    tonerLevel?: number;
-    status?: string;
-  };
+  const { paperLevel, tonerLevel, status } = req.body;
   const kiosk = await prisma.printer.update({
     where: { id: req.params.id },
     data: {
       ...(paperLevel !== undefined ? { paperLevel: Math.max(0, Math.min(100, paperLevel)) } : {}),
       ...(tonerLevel !== undefined ? { tonerLevel: Math.max(0, Math.min(100, tonerLevel)) } : {}),
-      ...(status ? { status: status as any } : {}),
+      ...(status ? { status } : {}),
     },
   });
   res.json({ kiosk });
 });
 
-adminRouter.get("/users", async (_req, res) => {
-  const users = await prisma.user.findMany({
-    orderBy: { createdAt: "desc" },
-    take: 200,
-    select: { id: true, name: true, phone: true, email: true, rollNumber: true, role: true, createdAt: true },
+// ── Support tickets ────────────────────────────────────────────────────────────
+adminRouter.get("/support", async (req, res) => {
+  const { status, limit = "50", offset = "0" } = req.query as Record<string, string>;
+  const where: any = status ? { status } : {};
+
+  const [tickets, total] = await Promise.all([
+    prisma.supportTicket.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: Math.min(parseInt(limit) || 50, 200),
+      skip: parseInt(offset) || 0,
+    }),
+    prisma.supportTicket.count({ where }),
+  ]);
+  res.json({ tickets, total });
+});
+
+adminRouter.patch("/support/:id", async (req, res) => {
+  const { status, reply } = req.body as { status?: string; reply?: string };
+  const ticket = await prisma.supportTicket.update({
+    where: { id: req.params.id },
+    data: {
+      ...(status ? { status } : {}),
+      ...(reply !== undefined ? { reply } : {}),
+    },
   });
-  res.json({ users });
+  res.json({ ticket });
+});
+
+// ── Platform settings ──────────────────────────────────────────────────────────
+adminRouter.get("/settings", async (_req, res) => {
+  const settings = await readSettings();
+  res.json({ settings: maskSecrets(settings) });
+});
+
+adminRouter.put("/settings", async (req, res) => {
+  const saved = await writeSettings(req.body?.settings ?? req.body);
+  res.json({ settings: maskSecrets(saved) });
+});
+
+// ── Change password (Account settings) ──────────────────────────────────────────
+const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1),
+  newPassword: z.string().min(6, "New password must be at least 6 characters"),
+});
+
+adminRouter.post("/change-password", async (req: AuthedRequest, res) => {
+  const parsed = changePasswordSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.errors[0]?.message || "Invalid input" });
+  }
+  const { currentPassword, newPassword } = parsed.data;
+
+  const user = await prisma.user.findUnique({ where: { id: req.user!.userId } });
+  if (!user) return res.status(404).json({ error: "Account not found" });
+  if (!user.passwordHash) {
+    return res.status(400).json({ error: "This account uses Google sign-in and has no password." });
+  }
+  const ok = await bcrypt.compare(currentPassword, user.passwordHash);
+  if (!ok) return res.status(401).json({ error: "Current password is incorrect" });
+
+  const passwordHash = await bcrypt.hash(newPassword, 10);
+  await prisma.user.update({ where: { id: user.id }, data: { passwordHash } });
+  res.json({ ok: true });
 });

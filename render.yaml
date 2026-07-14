@@ -1,9 +1,12 @@
-# Render Blueprint — deploys the PrintHub backend.
+# Render Blueprint — deploys the Prinsta admin backend.
 # In Render: New + → Blueprint → pick this repo. It reads this file.
 # (Or set the same values manually on an existing Web Service.)
+#
+# Cloud-only, admin-only backend: no hardware, no IoT/MQTT, no object storage.
+# All state lives in Neon PostgreSQL.
 services:
   - type: web
-    name: printhub-backend
+    name: prinsta-admin-backend
     runtime: node
     plan: free
     buildCommand: npm install --production=false && npm run build
@@ -18,25 +21,15 @@ services:
         sync: false                # set your own in the dashboard
       - key: DATABASE_URL
         sync: false                # paste your Neon connection string
-      - key: MQTT_URL
-        sync: false                # mqtts://user:pass@host:8883 (HiveMQ)
-      - key: B2_ENDPOINT
-        sync: false                # https://s3.us-east-005.backblazeb2.com
-      - key: B2_REGION
-        sync: false                # us-east-005
-      - key: B2_BUCKET
-        sync: false                # your bucket name
-      - key: B2_KEY_ID
-        sync: false                # Backblaze application keyID
-      - key: B2_APP_KEY
-        sync: false                # Backblaze applicationKey (K005…)
+      - key: GOOGLE_CLIENT_ID
+        sync: false                # Google OAuth client ID (admin console)
+      - key: APP_URL
+        sync: false                # https://prinsta.app (encoded into printer QR codes)
       - key: BACKEND_URL
-        sync: false                # https://printhub-backend.onrender.com
+        sync: false                # https://prinsta-admin-backend.onrender.com
       - key: CORS_ORIGINS
         sync: false                # your admin domain, or *
-      - key: PAYMENT_ENABLED
-        value: "false"
-      - key: PRICE_BW_PAISE
-        value: "200"
-      - key: PRICE_COLOR_PAISE
-        value: "1000"
+      - key: RAZORPAY_KEY_ID
+        sync: false                # rzp_test_… (swap to rzp_live_… to go live)
+      - key: RAZORPAY_KEY_SECRET
+        sync: false                # Razorpay key secret
