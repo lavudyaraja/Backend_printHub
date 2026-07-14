@@ -195,10 +195,12 @@ authRouter.post("/login", async (req, res) => {
   const ok = await bcrypt.compare(pw, user.passwordHash);
   if (!ok) return res.status(401).json({ error: "Invalid mobile number or password" });
 
-  // Login-alert email (best-effort — never blocks login; no-op if Brevo unset).
-  if (user.email && user.emailNotifications) {
+  // Login-alert email — sent ONCE per account, not on every sign-in.
+  // Best-effort: never blocks login, no-op if Brevo is unset.
+  if (user.email && user.emailNotifications && !user.loginAlertSent) {
     const { subject, html } = loginAlertEmail(user.name);
     sendEmail(user.email, subject, html);
+    await prisma.user.update({ where: { id: user.id }, data: { loginAlertSent: true } });
   }
 
   const token = signToken({ userId: user.id, role: user.role });

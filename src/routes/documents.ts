@@ -62,16 +62,80 @@ documentsRouter.post("/upload", requireAuth, upload.single("file"), async (req: 
 // ── Serve the raw file (used for previews) ──────────────────────────────────
 // No Authorization header (RN <Image> can't send one) — the cuid id is the
 // unguessable secret. Only non-deleted files are served.
-documentsRouter.get("/file/:id", async (req, res) => {
+//
+// Two shapes are exposed:
+//   /file/:id              — plain
+//   /file/:id/:name        — same bytes, but the URL ends in the real filename.
+// The trailing name matters: the Google and Office web viewers infer the
+// document type from the URL's extension, and hang on an extension-less URL.
+// "1-5, 8, 11-13" → [1,2,3,4,5,8,11,12,13], clamped to [1, max].
+function parseRange(s: string, max: number): number[] {
+  const out = new Set<number>();
+  for (const part of s.split(",")) {
+    const t = part.trim();
+    if (!t) continue;
+    const m = t.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (m) {
+      let a = parseInt(m[1], 10);
+      let b = parseInt(m[2], 10);
+      if (a > b) [a, b] = [b, a];
+      for (let i = Math.max(1, a); i <= Math.min(max, b); i++) out.add(i);
+    } else {
+      const n = parseInt(t, 10);
+      if (!isNaN(n) && n >= 1 && n <= max) out.add(n);
+    }
+  }
+  return Array.from(out).sort((a, b) => a - b);
+}
+
+/**
+ * Build a PDF containing only `range`'s pages. Returns null when the range is
+ * empty or covers everything, so the caller can just serve the original bytes.
+ */
+async function subsetPdf(buf: Uint8Array, range: string): Promise<Uint8Array | null> {
+  const src = await PDFDocument.load(buf, { ignoreEncryption: true });
+  const total = src.getPageCount();
+  const wanted = parseRange(range, total);
+  if (wanted.length === 0 || wanted.length === total) return null;
+
+  const out = await PDFDocument.create();
+  const copied = await out.copyPages(src, wanted.map((p) => p - 1)); // 0-indexed
+  copied.forEach((page) => out.addPage(page));
+  return out.save();
+}
+
+async function serveFile(req: any, res: any) {
   const doc = await prisma.document.findUnique({
     where: { id: req.params.id },
-    select: { fileData: true, mimeType: true, deleted: true },
+    select: { fileData: true, mimeType: true, fileName: true, fileType: true, deleted: true },
   });
   if (!doc || doc.deleted || !doc.fileData) return res.status(404).json({ error: "Not found" });
+
+  let body: Uint8Array = doc.fileData;
+
+  // ?pages=1-20 → serve just those pages. This is what the app previews AND what
+  // it sends to the printer, so the user is shown and charged for the same pages
+  // that actually come out. Only PDFs can be subset — there is no page model for
+  // Office formats without a converter.
+  const range = typeof req.query.pages === "string" ? req.query.pages : "";
+  if (range && doc.fileType === "pdf") {
+    try {
+      const subset = await subsetPdf(body, range);
+      if (subset) body = subset;
+    } catch (e) {
+      console.error("[documents] pdf subset failed, serving full file:", e);
+    }
+  }
+
   res.setHeader("Content-Type", doc.mimeType || "application/octet-stream");
-  res.setHeader("Cache-Control", "private, max-age=600");
-  res.send(Buffer.from(doc.fileData));
-});
+  // inline + the real filename so viewers can also fall back to the header.
+  res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(doc.fileName || "document")}"`);
+  res.setHeader("Cache-Control", "public, max-age=600");
+  res.send(Buffer.from(body));
+}
+
+documentsRouter.get("/file/:id", serveFile);
+documentsRouter.get("/file/:id/:name", serveFile);
 
 // Alias so the mobile "temp" preview path resolves for images.
 documentsRouter.get("/preview/temp/:id", (req, res) => {

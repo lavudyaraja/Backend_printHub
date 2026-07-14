@@ -85,6 +85,7 @@ model User {
   role              Role     @default(STUDENT)
   walletBalancePaise Int     @default(0)
   emailNotifications Boolean @default(true) // receive order + login emails
+  loginAlertSent    Boolean  @default(false) // the "new login" email is sent once, not every sign-in
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
