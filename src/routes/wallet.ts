@@ -32,6 +32,28 @@ walletRouter.post("/topup", requireAuth, async (req: AuthedRequest, res) => {
   res.json({ razorpayOrderId: rz.id, keyId: config.razorpay.keyId, mode: config.razorpay.mode, amountPaise: parsed.data.amountPaise });
 });
 
+// ── Simulate a successful top-up (TEST MODE ONLY) ───────────────────────────
+// Real UPI apps can't complete a Razorpay *test* payment, so this credits the
+// wallet directly for testing. Hard-gated to test mode — refuses the moment live
+// keys are set, so the app falls back to the real hosted checkout.
+walletRouter.post("/simulate-topup", requireAuth, async (req: AuthedRequest, res) => {
+  if (config.razorpay.mode !== "test") {
+    return res.status(403).json({ error: "Simulated payments are disabled in live mode." });
+  }
+  const parsed = z.object({ amountPaise: z.number().int().min(MIN_TOPUP_PAISE) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: `Minimum top-up is ₹${MIN_TOPUP_PAISE / 100}.` });
+  const userId = req.user!.userId;
+
+  const u = await prisma.$transaction(async (tx) => {
+    const updated = await tx.user.update({ where: { id: userId }, data: { walletBalancePaise: { increment: parsed.data.amountPaise } } });
+    await tx.walletTransaction.create({
+      data: { userId, type: "CREDIT", amountPaise: parsed.data.amountPaise, balancePaise: updated.walletBalancePaise, description: "Wallet top-up (test)", razorpayId: "test_" + Date.now() },
+    });
+    return updated;
+  });
+  res.json({ ok: true, balancePaise: u.walletBalancePaise, test: true });
+});
+
 // ── Hosted checkout page (WebView) ──────────────────────────────────────────
 walletRouter.get("/checkout", async (req, res) => {
   const { orderId, token } = req.query as { orderId?: string; token?: string };
