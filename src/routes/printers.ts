@@ -108,8 +108,21 @@ printersRouter.get("/connect/:uniquePrinterId", requireAuth, async (req, res) =>
   if (!printer) {
     return res.status(404).json({ error: "Printer not found. Please scan a valid Prinsta printer QR." });
   }
-  if (printer.status === "OFFLINE") {
-    return res.status(503).json({ error: "This printer is currently offline. Please try another one.", printer });
+  // Note: we intentionally do NOT block on status === "OFFLINE" here. The app
+  // prints directly over the printer's own Wi-Fi Direct (SoftAP) — reachability
+  // is proven by the phone joining that network and the IPP job succeeding, not
+  // by the backend-tracked status (which defaults to OFFLINE at registration and
+  // is only updated by an agent/admin). Blocking here made every freshly
+  // registered printer un-connectable ("connection failed") even though it was
+  // perfectly printable. Only ERROR-class states are surfaced as a hard block.
+  if (printer.status === "ERROR" || printer.status === "OUT_OF_PAPER") {
+    return res.status(503).json({
+      error:
+        printer.status === "OUT_OF_PAPER"
+          ? "This printer is out of paper. Please try another one."
+          : "This printer reported an error. Please try another one.",
+      printer,
+    });
   }
   res.json({ printer });
 });
