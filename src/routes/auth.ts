@@ -347,3 +347,34 @@ authRouter.delete("/me", requireAuth, async (req: AuthedRequest, res) => {
     res.status(500).json({ error: "Could not delete account. Please email support." });
   }
 });
+
+// ── Change your own password ────────────────────────────────────────────────
+// Lived on the ADMIN-guarded admin router, which meant a vendor could not
+// change their own password. Every lookup here is already scoped to
+// req.user.userId — nothing about it is an admin capability.
+const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1),
+  newPassword: z.string().min(6, "New password must be at least 6 characters"),
+});
+
+authRouter.post("/change-password", requireAuth, async (req: AuthedRequest, res) => {
+  const parsed = changePasswordSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.errors[0]?.message || "Invalid input" });
+  }
+  const { currentPassword, newPassword } = parsed.data;
+
+  const user = await prisma.user.findUnique({ where: { id: req.user!.userId } });
+  if (!user) return res.status(404).json({ error: "Account not found" });
+  if (!user.passwordHash) {
+    return res.status(400).json({ error: "This account uses Google sign-in and has no password." });
+  }
+  const ok = await bcrypt.compare(currentPassword, user.passwordHash);
+  if (!ok) return res.status(401).json({ error: "Current password is incorrect" });
+
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { passwordHash: await bcrypt.hash(newPassword, 10) },
+  });
+  res.json({ ok: true });
+});

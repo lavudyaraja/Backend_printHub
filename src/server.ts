@@ -7,6 +7,8 @@ import rateLimit from "express-rate-limit";
 
 import { config } from "./lib/config";
 import { PAISE_PER_POINT, TOPUP_BONUS_TIERS } from "./lib/points";
+import { DEFAULT_BW_PAGE_PAISE, DEFAULT_COLOR_PAGE_PAISE, BLANK_PAGE_PAISE } from "./lib/pricing";
+import { REFERRER_REWARD_POINTS, REFEREE_REWARD_POINTS } from "./referrals/types";
 import { authRouter } from "./routes/auth";
 import { printersRouter } from "./routes/printers";
 import { adminRouter } from "./routes/admin";
@@ -14,6 +16,10 @@ import { documentsRouter } from "./routes/documents";
 import { ordersRouter } from "./routes/orders";
 import { pointsRouter } from "./routes/points";
 import { vendorsRouter } from "./routes/vendors";
+import { bankAccountRouter } from "./routes/bankAccount";
+import { supportRouter } from "./routes/support";
+import { referralsRouter } from "./referrals/router";
+import { operationsRouter } from "./operations/router";
 import { notificationsRouter } from "./routes/notifications";
 import { complaintsRouter } from "./complaints/router";
 import { startCleanup } from "./lib/cleanup";
@@ -48,6 +54,17 @@ app.get("/api/config", (_req, res) =>
     pointsDiscountPercent: config.pointsDiscountPercent,
     paisePerPoint: PAISE_PER_POINT,
     topupBonusTiers: TOPUP_BONUS_TIERS,
+    // Indicative page rates, for the in-app cost calculator. A real order is
+    // priced from the printer it is sent to (a shop can set its own rates), so
+    // these are the platform defaults and the calculator says as much rather
+    // than presenting them as a quote.
+    defaultBwPagePaise: DEFAULT_BW_PAGE_PAISE,
+    defaultColorPagePaise: DEFAULT_COLOR_PAGE_PAISE,
+    blankPagePaise: BLANK_PAGE_PAISE,
+    referral: {
+      referrerPoints: REFERRER_REWARD_POINTS,
+      refereePoints: REFEREE_REWARD_POINTS,
+    },
     // Old key, kept so already-installed mobile builds keep reading a discount.
     walletDiscountPercent: config.pointsDiscountPercent,
   })
@@ -65,6 +82,13 @@ const authLimiter = rateLimit({
 app.use("/api/auth", authLimiter, authRouter);
 app.use("/api/printers", printersRouter);
 app.use("/api/vendors", vendorsRouter);
+// Self-scoped payout details for any console user — see routes/bankAccount.
+app.use("/api/bank-account", bankAccountRouter);
+// Raising a ticket with the operator. Triage lives on /api/admin/support.
+app.use("/api/support", supportRouter);
+app.use("/api/referrals", referralsRouter);
+// Operator queues: print jobs, printer health, verifications, support.
+app.use("/api/operations", operationsRouter);
 app.use("/api/admin", adminRouter);
 app.use("/api/documents", documentsRouter);
 app.use("/api/orders", ordersRouter);

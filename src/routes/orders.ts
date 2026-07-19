@@ -5,15 +5,15 @@ import { z } from "zod";
 import { nanoid } from "nanoid";
 import { prisma } from "../lib/prisma";
 import { config, publicBaseUrl } from "../lib/config";
+import { BLANK_PAGE_PAISE, DEFAULT_BW_PAGE_PAISE, DEFAULT_COLOR_PAGE_PAISE } from "../lib/pricing";
 import { requireAuth, type AuthedRequest } from "../middleware/authGuard";
+import { maybePayReferralReward } from "../referrals/service";
 import { createRazorpayOrder, verifyPaymentSignature, checkoutPage } from "../lib/razorpay";
 import { createCheckoutSession, consumeCheckoutSession, peekCheckoutSession } from "../lib/checkoutSession";
 import { priceInPoints, pointsToPaise } from "../lib/points";
 
 export const ordersRouter = Router();
 
-const DEFAULT_BW = 200;
-const DEFAULT_COLOR = 1000;
 
 // Parse "1:BW,2:COLOR,5:COLOR" → [{page, mode}]
 function parsePageModes(s: string): { page: number; mode: "BW" | "COLOR" }[] {
@@ -72,7 +72,7 @@ ordersRouter.post("/from-temp", requireAuth, async (req: AuthedRequest, res) => 
   }
 
   // Rates and ownership from the target printer (rates fall back to defaults).
-  let bw = DEFAULT_BW, color = DEFAULT_COLOR;
+  let bw = DEFAULT_BW_PAGE_PAISE, color = DEFAULT_COLOR_PAGE_PAISE;
   let vendorId: string | null = null;
   let locationId: string | null = null;
   if (d.printerId) {
@@ -181,7 +181,6 @@ ordersRouter.post("/from-temp", requireAuth, async (req: AuthedRequest, res) => 
 // Plain sheets, no document to print. Priced per sheet at a flat rate rather
 // than at the printer's BW/colour rates — nothing is being imaged, so the cost
 // is the paper, not the toner.
-const BLANK_PAGE_PAISE = 100; // ₹1.00 per sheet
 
 const blankSchema = z.object({
   pagesCount: z.number().int().min(1).max(100),
@@ -427,6 +426,15 @@ ordersRouter.post("/:id/status", requireAuth, async (req: AuthedRequest, res) =>
     return res.json({ ok: true, status: order.status });
   }
   const updated = await prisma.order.update({ where: { id: order.id }, data: { status: parsed.data.status } });
+
+  // A first completed print is what earns a referral, for both sides. Awaited
+  // so the balance has moved by the time the app refetches it, but it swallows
+  // its own errors — a reward that failed must not fail the status update that
+  // told the user their print is done.
+  if (updated.status === "COMPLETED") {
+    await maybePayReferralReward(order.userId);
+  }
+
   res.json({ ok: true, status: updated.status });
 });
 

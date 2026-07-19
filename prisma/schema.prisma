@@ -95,6 +95,25 @@ enum PointsTxnType {
   @@map("WalletTxnType")
 }
 
+/// Why an order was refunded. Coarse on purpose — it exists to explain the
+/// credit on the user's ledger, not to drive logic.
+enum RefundReason {
+  PRINT_FAILED      // the printer reported the job failed
+  PRINTER_STUCK     // job started and never finished — jam, freeze, power cut
+  PRINTER_OFFLINE   // machine went away before the job ran
+  PARTIAL_PRINT     // some pages came out, some didn't
+  CANCELLED_BY_USER
+  ADMIN_GOODWILL    // staff decision, e.g. after a complaint
+  OTHER
+}
+
+/// How a refund came about. Automatic refunds fire when an order lands in
+/// FAILED; manual ones are issued by staff from the console.
+enum RefundOrigin {
+  AUTOMATIC
+  MANUAL
+}
+
 enum PaymentMethod {
   /// Paid from the user's Prinsta Points balance. The stored value is still
   /// "WALLET" so existing rows keep validating.
@@ -131,17 +150,46 @@ model User {
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
+  /// This account's own code to share. Generated on first request rather than
+  /// at sign-up, so accounts that predate referrals get one too.
+  referralCode       String?  @unique
+  /// The account whose code this user entered. Set once and never changed —
+  /// letting it move would let the reward be claimed repeatedly.
+  referredById       String?
+  /// Self-relation, so the operator console can list who invited whom without
+  /// a second round of lookups. `SetNull` rather than cascade: deleting an
+  /// inviter must not take their invitees' accounts with it.
+  referredBy         User?    @relation("UserReferrals", fields: [referredById], references: [id], onDelete: SetNull)
+  referrals          User[]   @relation("UserReferrals")
+  /// When the referral reward was paid out, for both sides. Its presence is
+  /// what stops a second payout; the reward fires on the invited user's first
+  /// completed order, and orders complete more than once over a lifetime.
+  referralRewardedAt DateTime?
+
+  /// Set when an admin bans the account. Null means active — a nullable
+  /// timestamp rather than a boolean so "when" and "whether" are one field and
+  /// can't disagree.
+  bannedAt      DateTime?
+  /// Shown to the user on the sign-in screen, so a ban isn't a silent failure.
+  banReason     String?
+  /// The admin who applied the ban. Not a relation: it points at another User
+  /// row, and a self-relation here would need a back-reference that has no use.
+  bannedById    String?
+
   documents     Document[]
   orders        Order[]
   notifications Notification[]
   pointsTxns    PointsTransaction[]
   complaints    Complaint[]
+  refunds       Refund[]
   bankAccount   BankAccount?
   /// Set only for vendor-console accounts.
   vendor        Vendor?
 
   @@index([phone])
   @@index([email])
+  /// Counting a user's invitees is a hot path on the referrals screen.
+  @@index([referredById])
 }
 
 /// Payout destination for a shop owner. One per account. The full account
@@ -268,6 +316,7 @@ model Order {
   location Location? @relation(fields: [locationId], references: [id], onDelete: SetNull)
   printJob PrintJob?
   complaints Complaint[]
+  refund     Refund?
 
   @@index([userId])
   @@index([status])
@@ -286,6 +335,20 @@ model Vendor {
   shopName     String
   contactName  String?
   mobileNumber String?
+  /// Set when an operator has checked the shop out. Null means unverified;
+  /// `verificationNote` carries the reason when a check is rejected.
+  verifiedAt   DateTime?
+  verifiedById String?
+  verificationNote String?
+  /// Set when a verification was explicitly turned down, so a rejected shop is
+  /// distinguishable from one nobody has looked at yet.
+  rejectedAt   DateTime?
+  /// Set when an admin bans the shop. While set, its printers are hidden from
+  /// the app and take no new orders. Orders already paid for are left alone —
+  /// the customer still needs their print, or their refund.
+  bannedAt     DateTime?
+  banReason    String?
+  bannedById   String?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -334,6 +397,12 @@ model Printer {
   macAddress     String?
   wifiSsid       String?       // Wi-Fi Direct SSID the printer broadcasts, e.g. "DIRECT-Pantum-BP5100"
   accessPassword String?       // Wi-Fi Direct join password (shared with the app to connect + print)
+
+  /// Set once an operator has confirmed this machine is real and reachable.
+  verifiedAt     DateTime?
+  verifiedById   String?
+  rejectedAt     DateTime?
+  verificationNote String?
 
   // Status
   status         PrinterStatus @default(OFFLINE)
@@ -431,6 +500,40 @@ model Complaint {
   @@index([userId, createdAt])
   @@index([status])
   @@index([printerId])
+}
+
+/// A refund issued against an order.
+///
+/// Refunds are always paid as Prinsta Points, whatever the order was paid with:
+/// the credit lands instantly, so a student whose print jammed can walk to the
+/// next machine and try again rather than waiting a week for a card reversal.
+///
+/// One row per order — the unique constraint is what makes the whole thing safe
+/// to retry. A duplicate refund is real money, and both the automatic hook and
+/// the console button can fire for the same failed order, so the database
+/// refuses the second one rather than trusting either caller to check first.
+model Refund {
+  id            String       @id @default(cuid())
+  orderId       String       @unique
+  userId        String
+  /// What the order cost, in paise — kept so the ledger still reconciles if
+  /// the points rate is ever changed.
+  amountPaise   Int
+  /// What was actually credited back, in points.
+  pointsCredited Int
+  reason        RefundReason
+  origin        RefundOrigin @default(AUTOMATIC)
+  /// Free text from staff on a manual refund.
+  note          String?
+  /// The admin who issued a manual refund. Null for automatic ones.
+  issuedById    String?
+  createdAt     DateTime     @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, createdAt])
 }
 
 /// Evidence photo attached to a complaint — a shot of the jam, the faded page,
