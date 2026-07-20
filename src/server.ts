@@ -20,6 +20,8 @@ import { bankAccountRouter } from "./routes/bankAccount";
 import { supportRouter } from "./routes/support";
 import { referralsRouter } from "./referrals/router";
 import { operationsRouter } from "./operations/router";
+import { financeRouter } from "./finance/router";
+import { systemRouter } from "./system/router";
 import { notificationsRouter } from "./routes/notifications";
 import { complaintsRouter } from "./complaints/router";
 import { startCleanup } from "./lib/cleanup";
@@ -89,6 +91,10 @@ app.use("/api/support", supportRouter);
 app.use("/api/referrals", referralsRouter);
 // Operator queues: print jobs, printer health, verifications, support.
 app.use("/api/operations", operationsRouter);
+// Revenue, transactions, refunds, commissions, payouts.
+app.use("/api/finance", financeRouter);
+// Notifications, logs, security, settings.
+app.use("/api/system", systemRouter);
 app.use("/api/admin", adminRouter);
 app.use("/api/documents", documentsRouter);
 app.use("/api/orders", ordersRouter);

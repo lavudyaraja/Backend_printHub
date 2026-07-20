@@ -114,6 +114,16 @@ enum RefundOrigin {
   MANUAL
 }
 
+/// Where a payout is in its life. Nothing here talks to a bank — a payout is
+/// recorded by staff after they have made the transfer, so PROCESSING means
+/// "someone is doing it", not "the money is in flight".
+enum PayoutStatus {
+  PENDING
+  PROCESSING
+  PAID
+  FAILED
+}
+
 enum PaymentMethod {
   /// Paid from the user's Prinsta Points balance. The stored value is still
   /// "WALLET" so existing rows keep validating.
@@ -356,6 +366,7 @@ model Vendor {
   locations Location[]
   printers  Printer[]
   orders    Order[]
+  payouts   Payout[]
 }
 
 /// A physical place a vendor operates from — one vendor can run several.
@@ -534,6 +545,44 @@ model Refund {
 
   @@index([userId])
   @@index([userId, createdAt])
+}
+
+/// Money paid out to a vendor for a period's takings.
+///
+/// The platform does not move money by itself: an operator makes the transfer
+/// and records it here. That is why `status` can be FAILED and why `reference`
+/// holds the bank's transaction id — this table is the record of what happened,
+/// not the thing that makes it happen.
+model Payout {
+  id            String       @id @default(cuid())
+  vendorId      String
+  /// Gross takings this payout covers, before the platform's cut.
+  grossPaise    Int
+  /// The platform's cut, at the rate in force when the payout was drawn up.
+  commissionPaise Int        @default(0)
+  /// What the vendor actually receives — gross less commission.
+  netPaise      Int
+  /// The window this payout settles, so two payouts can't claim the same orders.
+  periodStart   DateTime
+  periodEnd     DateTime
+  /// How many completed orders it covers, for reconciliation.
+  orderCount    Int          @default(0)
+  status        PayoutStatus @default(PENDING)
+  /// Bank/UPI transaction reference, once the transfer has been made.
+  reference     String?
+  /// Why it failed, when it did.
+  failureReason String?
+  note          String?
+  createdById   String?
+  processedAt   DateTime?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  vendor Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  @@index([vendorId])
+  @@index([status])
+  @@index([vendorId, periodStart])
 }
 
 /// Evidence photo attached to a complaint — a shot of the jam, the faded page,

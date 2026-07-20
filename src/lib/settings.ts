@@ -20,6 +20,10 @@ export type Settings = {
     minOrderPaise: number;
     gstPercent: number;
     extraChargesPaise: number;
+    /// The platform's cut of a completed order, as a percent of the order total.
+    /// Zero means the platform takes nothing, which is the honest default until
+    /// someone sets a real rate.
+    commissionPercent: number;
   };
   payments: {
     razorpayKeyId: string;
@@ -69,6 +73,7 @@ export const DEFAULT_SETTINGS: Settings = {
     bwPricePaise: 200,
     colorPricePaise: 1000,
     minOrderPaise: 0,
+    commissionPercent: 0,
     gstPercent: 18,
     extraChargesPaise: 0,
   },
