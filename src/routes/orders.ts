@@ -9,42 +9,11 @@ import { BLANK_PAGE_PAISE, DEFAULT_BW_PAGE_PAISE, DEFAULT_COLOR_PAGE_PAISE } fro
 import { requireAuth, type AuthedRequest } from "../middleware/authGuard";
 import { maybePayReferralReward } from "../referrals/service";
 import { createRazorpayOrder, verifyPaymentSignature, checkoutPage } from "../lib/razorpay";
-import { planSplit, recordTransferForPayment } from "../lib/razorpayRoute";
 import { createCheckoutSession, consumeCheckoutSession, peekCheckoutSession } from "../lib/checkoutSession";
 import { priceInPoints, pointsToPaise } from "../lib/points";
+import { issuePartialRefund } from "../refunds/service";
 
 export const ordersRouter = Router();
-
-/**
- * The message a customer gets when a direct payment can't be routed. Each
- * reason is a different fault, and only one of them is theirs to fix (paying
- * with Points), so they are phrased apart rather than as one generic error.
- */
-function directPayBlocked(reason?: string) {
-  switch (reason) {
-    case "VENDOR_NOT_ONBOARDED":
-      return {
-        error: "This shop isn't set up to take card or UPI payments yet. You can pay with Points instead.",
-        code: "VENDOR_NOT_ONBOARDED",
-        payWithPoints: true,
-      };
-    case "NO_VENDOR":
-      return {
-        error: "This printer isn't linked to a shop yet, so it can't take a direct payment. Pay with Points instead.",
-        code: "NO_VENDOR",
-        payWithPoints: true,
-      };
-    case "AMOUNT_TOO_SMALL":
-      return {
-        error: "This order is too small to pay by card or UPI. Please pay with Points.",
-        code: "AMOUNT_TOO_SMALL",
-        payWithPoints: true,
-      };
-    default:
-      return { error: "This order can't be paid directly right now. Please pay with Points." };
-  }
-}
-
 
 // Parse "1:BW,2:COLOR,5:COLOR" → [{page, mode}]
 function parsePageModes(s: string): { page: number; mode: "BW" | "COLOR" }[] {
@@ -203,21 +172,11 @@ ordersRouter.post("/from-temp", requireAuth, async (req: AuthedRequest, res) => 
   }
   const order = await prisma.order.create({ data: { ...baseData, status: "PENDING_PAYMENT" } });
 
-  // Work out the Route split before charging. A direct payment must go to the
-  // shop that owns the printer — never into a platform balance — so an order
-  // that can't be routed is refused here rather than taken and held.
-  const split = await planSplit(order.id);
-  if (!split.transfer) {
-    await prisma.order.delete({ where: { id: order.id } }).catch(() => {});
-    return res.status(409).json(directPayBlocked(split.reason));
-  }
-
-  const rz = await createRazorpayOrder(
-    costPaise,
-    order.orderCode,
-    { orderId: order.id },
-    [split.transfer]
-  );
+  // The full amount is collected into the platform account — no split. The
+  // shop's share (cost less commission) accrues against its completed orders
+  // and is settled later through the payout system, so a direct payment doesn't
+  // need the vendor to be onboarded to any gateway to be accepted.
+  const rz = await createRazorpayOrder(costPaise, order.orderCode, { orderId: order.id });
   const updated = await prisma.order.update({ where: { id: order.id }, data: { razorpayOrderId: rz.id } });
 
   res.json({ order: updated, razorpayOrderId: rz.id, keyId: config.razorpay.keyId, mode: config.razorpay.mode, amountPaise: costPaise });
@@ -343,21 +302,9 @@ ordersRouter.post("/blank", requireAuth, async (req: AuthedRequest, res) => {
   }
   const order = await prisma.order.create({ data: { ...baseData, paymentMethod: "UPI", status: "PENDING_PAYMENT" } });
 
-  // Same rule as a document order: a direct payment must reach the shop, so an
-  // order that can't be routed is refused rather than taken and held.
-  const split = await planSplit(order.id);
-  if (!split.transfer) {
-    await prisma.order.delete({ where: { id: order.id } }).catch(() => {});
-    await prisma.document.delete({ where: { id: doc.id } }).catch(() => {});
-    return res.status(409).json(directPayBlocked(split.reason));
-  }
-
-  const rz = await createRazorpayOrder(
-    costPaise,
-    order.orderCode,
-    { orderId: order.id },
-    [split.transfer]
-  );
+  // Collected in full to the platform account; the shop's share is settled later
+  // through payouts (see the document-order path above).
+  const rz = await createRazorpayOrder(costPaise, order.orderCode, { orderId: order.id });
   const updated = await prisma.order.update({ where: { id: order.id }, data: { razorpayOrderId: rz.id } });
 
   res.json({ order: updated, razorpayOrderId: rz.id, keyId: config.razorpay.keyId, mode: config.razorpay.mode, amountPaise: costPaise });
@@ -442,12 +389,6 @@ ordersRouter.post("/verify", async (req, res) => {
       await tx.order.update({ where: { id: order.id }, data: { status: "PAID", razorpayPaymentId: razorpay_payment_id } });
       if (order.printerId) await tx.printJob.create({ data: { orderId: order.id, printerId: order.printerId, status: "QUEUED" } });
     });
-
-    // Note which Route transfer carried the shop's share, so a later refund can
-    // reverse that exact leg. Best-effort and outside the transaction: the
-    // payment is already captured and settled, and failing to record the id
-    // must not undo a successful payment.
-    await recordTransferForPayment(order.id, razorpay_payment_id);
   }
 
   // Spend the session only once the order is actually marked paid.
@@ -481,8 +422,19 @@ ordersRouter.post("/:id/simulate-pay", requireAuth, async (req: AuthedRequest, r
 // ── Advance an order's print status (owner) ─────────────────────────────────
 // The app calls this as the user prints: PAID → PRINTING (dialog opened) →
 // COMPLETED (print finished). Only ever moves forward from a paid/printing state.
+//
+// When a print is interrupted — power cut, jam, the printer stuck part-way — the
+// app reports FAILED with `printedPages`, the count that actually came out. The
+// server splits the money by pages: the unprinted share is refunded to the
+// customer as Points, and the shop earns (and settles) only the printed share.
 ordersRouter.post("/:id/status", requireAuth, async (req: AuthedRequest, res) => {
-  const parsed = z.object({ status: z.enum(["PRINTING", "COMPLETED", "PAID"]) }).safeParse(req.body);
+  const parsed = z
+    .object({
+      status: z.enum(["PRINTING", "COMPLETED", "PAID", "FAILED"]),
+      /** Pages actually printed, on a FAILED (interrupted) report. */
+      printedPages: z.coerce.number().int().min(0).optional(),
+    })
+    .safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid status" });
 
   const order = await prisma.order.findFirst({ where: { id: req.params.id, userId: req.user!.userId } });
@@ -492,6 +444,30 @@ ordersRouter.post("/:id/status", requireAuth, async (req: AuthedRequest, res) =>
   if (!["PAID", "READY", "PRINTING"].includes(order.status)) {
     return res.json({ ok: true, status: order.status });
   }
+
+  // Interrupted print: settle the money by pages before recording the status.
+  if (parsed.data.status === "FAILED") {
+    const printed = parsed.data.printedPages ?? 0;
+    const result = await issuePartialRefund(order.id, printed);
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+
+    // Some pages came out → the order is partially fulfilled and the shop earns
+    // its share, so it counts as COMPLETED. Nothing came out → a clean FAILED
+    // with the whole cost refunded.
+    const finalStatus = result.kind === "full" ? "FAILED" : "COMPLETED";
+    const updated = await prisma.order.update({
+      where: { id: order.id },
+      data: { status: finalStatus },
+    });
+    if (finalStatus === "COMPLETED") await maybePayReferralReward(order.userId);
+    return res.json({
+      ok: true,
+      status: updated.status,
+      refundPointsCredited: result.pointsCredited,
+      settlementPaise: result.settlementPaise,
+    });
+  }
+
   const updated = await prisma.order.update({ where: { id: order.id }, data: { status: parsed.data.status } });
 
   // A first completed print is what earns a referral, for both sides. Awaited

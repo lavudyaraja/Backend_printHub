@@ -4,6 +4,7 @@
 import { Router, type NextFunction, type RequestHandler, type Response } from "express";
 import multer from "multer";
 import { requireAuth, type AuthedRequest } from "../middleware/authGuard";
+import { requireVendorId } from "../lib/vendorScope";
 import { signFileToken, verifyFileToken } from "../lib/fileToken";
 import {
   ACCEPTED_IMAGE_MIMES,
@@ -17,9 +18,12 @@ import {
   cancelComplaint,
   countOpenComplaints,
   createComplaint,
+  forwardComplaintToAdmin,
   getComplaint,
   getPhotoBytes,
   listComplaints,
+  listComplaintsForVendor,
+  vendorComplaintStats,
 } from "./service";
 
 export const complaintsRouter = Router();
@@ -112,6 +116,48 @@ complaintsRouter.get(
   requireAuth,
   asyncRoute(async (req, res) => {
     res.json({ count: await countOpenComplaints(req.user!.userId) });
+  })
+);
+
+// ── Vendor queue ────────────────────────────────────────────────────────────
+// Declared before /:id so "vendor" is never read as a complaint id. A shop sees
+// only its own issues; the vendorId is resolved from the token, never the body.
+complaintsRouter.get(
+  "/vendor/queue",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const vendorId = await requireVendorId(req, res);
+    if (!vendorId) return; // requireVendorId already replied
+
+    const q = req.query as Record<string, string>;
+    const result = await listComplaintsForVendor(vendorId, {
+      status: q.status || undefined,
+      limit: parseInt(q.limit) || 50,
+      skip: parseInt(q.offset) || 0,
+    });
+    res.json({
+      complaints: result.complaints.map(withPhotoTokens),
+      total: result.total,
+      stats: await vendorComplaintStats(vendorId),
+    });
+  })
+);
+
+/** Hand a refund-bearing issue up to the platform to decide. */
+complaintsRouter.post(
+  "/vendor/:id/forward",
+  requireAuth,
+  asyncRoute(async (req, res) => {
+    const vendorId = await requireVendorId(req, res);
+    if (!vendorId) return;
+
+    const note = typeof req.body?.note === "string" ? req.body.note : undefined;
+    const result = await forwardComplaintToAdmin(vendorId, req.params.id, note);
+    if (!result.ok) {
+      if (result.reason === "NOT_FOUND") return res.status(404).json({ error: "Complaint not found" });
+      return res.status(409).json({ error: "This complaint can no longer be forwarded." });
+    }
+    res.json({ complaint: withPhotoTokens(result.complaint!) });
   })
 );
 

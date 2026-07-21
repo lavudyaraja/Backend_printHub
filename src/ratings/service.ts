@@ -119,11 +119,27 @@ export async function submitRating(
 ): Promise<SubmitResult> {
   const order = await prisma.order.findUnique({
     where: { id: opts.orderId },
-    select: { id: true, userId: true, vendorId: true, status: true, updatedAt: true },
+    select: { id: true, userId: true, vendorId: true, printerId: true, status: true, updatedAt: true },
   });
 
   if (!order) return { ok: false, reason: "ORDER_NOT_FOUND" };
-  if (!order.vendorId) return { ok: false, reason: "NO_VENDOR" };
+
+  // An order copies its vendorId off the printer at creation, but an order placed
+  // before that printer was linked to a shop (or seeded data) can be missing it.
+  // Recover the shop from the printer's current owner rather than refusing to let
+  // the customer rate, and backfill the order so every later read agrees.
+  let vendorId = order.vendorId;
+  if (!vendorId && order.printerId) {
+    const printer = await prisma.printer.findUnique({
+      where: { id: order.printerId },
+      select: { vendorId: true },
+    });
+    vendorId = printer?.vendorId ?? null;
+    if (vendorId) {
+      await prisma.order.update({ where: { id: order.id }, data: { vendorId } }).catch(() => {});
+    }
+  }
+  if (!vendorId) return { ok: false, reason: "NO_VENDOR" };
 
   // Confirm the author was actually on this order. A student must own it; a
   // vendor must be the shop that printed it. Anyone else is told the order does
@@ -132,7 +148,7 @@ export async function submitRating(
   if (opts.direction === "USER_TO_VENDOR") {
     if (order.userId !== opts.authorId) return { ok: false, reason: "ORDER_NOT_FOUND" };
   } else {
-    if (!opts.authorVendorId || order.vendorId !== opts.authorVendorId) {
+    if (!opts.authorVendorId || vendorId !== opts.authorVendorId) {
       return { ok: false, reason: "ORDER_NOT_FOUND" };
     }
     // A shop rating its own login's order would be rating itself.
@@ -156,11 +172,11 @@ export async function submitRating(
           tags,
           authorId: opts.authorId,
           userId: order.userId,
-          vendorId: order.vendorId!,
+          vendorId: vendorId,
         },
         select: { id: true },
       });
-      await recomputeFor(tx, opts.direction, { userId: order.userId, vendorId: order.vendorId! });
+      await recomputeFor(tx, opts.direction, { userId: order.userId, vendorId: vendorId });
       return rating;
     });
 

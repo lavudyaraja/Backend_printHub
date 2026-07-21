@@ -9,6 +9,7 @@ import { pointsToPaise } from "../lib/points";
 import { REFERRER_REWARD_POINTS, REFEREE_REWARD_POINTS } from "../referrals/types";
 import { adminRatingStats, listRatingsForAdmin, setRatingVisibility, summarize } from "../ratings/service";
 import { RATING_ADMIN_SELECT } from "../ratings/types";
+import { refundComplaint } from "../complaints/service";
 
 export const adminRouter = Router();
 adminRouter.use(requireAuth, requireRole("ADMIN"));
@@ -364,7 +365,9 @@ adminRouter.get("/disputes", async (req, res) => {
       select: {
         id: true, code: true, category: true, subject: true, description: true,
         status: true, resolution: true, resolvedAt: true, createdAt: true,
+        refundRequested: true, forwardedAt: true, forwardNote: true, refundId: true,
         user: { select: { id: true, name: true, phone: true, email: true } },
+        vendor: { select: { id: true, shopName: true } },
         printer: { select: { name: true, uniquePrinterId: true, shopName: true } },
         order: { select: { id: true, orderCode: true, status: true, costPaise: true } },
         _count: { select: { photos: true } },
@@ -378,17 +381,38 @@ adminRouter.get("/disputes", async (req, res) => {
     total: byStatus.reduce((sum, r) => sum + r._count._all, 0),
     open: countFor("OPEN"),
     inReview: countFor("IN_REVIEW"),
+    forwarded: countFor("FORWARDED"),
     resolved: countFor("RESOLVED"),
+    refunded: countFor("REFUNDED"),
     rejected: countFor("REJECTED"),
     disputes,
   });
+});
+
+/**
+ * Grant the refund an issue asked for. Admin-only, and the only place a
+ * complaint-driven refund is issued — see complaints/service.ts. Credits the
+ * customer's Points, marks the complaint REFUNDED, and notifies both the
+ * customer and the shop.
+ */
+adminRouter.post("/disputes/:id/refund", async (req: AuthedRequest, res) => {
+  const note = typeof req.body?.resolution === "string" ? req.body.resolution : undefined;
+  const result = await refundComplaint(req.params.id, req.user!.userId, note);
+  if (!result.ok) {
+    if (result.reason === "NOT_FOUND") return res.status(404).json({ error: "Dispute not found" });
+    if (result.reason === "NO_ORDER") {
+      return res.status(409).json({ error: "This complaint isn't tied to an order, so there's nothing to refund." });
+    }
+    return res.status(409).json({ error: result.detail || "Could not issue the refund." });
+  }
+  res.json({ dispute: result.complaint, pointsCredited: result.pointsCredited });
 });
 
 /** Move a dispute along, with the reply the user will see. */
 adminRouter.patch("/disputes/:id", async (req, res) => {
   const parsed = z
     .object({
-      status: z.enum(["OPEN", "IN_REVIEW", "RESOLVED", "REJECTED"]).optional(),
+      status: z.enum(["OPEN", "IN_REVIEW", "FORWARDED", "RESOLVED", "REJECTED"]).optional(),
       resolution: z.string().trim().max(2000).optional(),
     })
     .safeParse(req.body);

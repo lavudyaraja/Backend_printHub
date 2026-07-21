@@ -9,6 +9,7 @@ import { z } from "zod";
 import { prisma } from "../lib/prisma";
 import { requireAuth, requireRole, type AuthedRequest } from "../middleware/authGuard";
 import { readSettings } from "../lib/settings";
+import { settlementGross, settlementGrossByVendor, vendorSettlementGross } from "../lib/settlement";
 
 export const financeRouter = Router();
 financeRouter.use(requireAuth, requireRole("ADMIN"));
@@ -252,25 +253,20 @@ financeRouter.get("/commissions", async (_req, res) => {
   const rate = settings.pricing?.commissionPercent ?? 0;
 
   const [byVendor, vendors, total] = await Promise.all([
-    prisma.order.groupBy({
-      by: ["vendorId"],
-      where: EARNED,
-      _sum: { costPaise: true },
-      _count: { _all: true },
-    }),
+    settlementGrossByVendor(),
     prisma.vendor.findMany({ select: { id: true, shopName: true } }),
-    prisma.order.aggregate({ _sum: { costPaise: true }, _count: { _all: true }, where: EARNED }),
+    settlementGross(),
   ]);
 
   const shopName = new Map(vendors.map((v) => [v.id, v.shopName]));
-  const rows = byVendor
-    .map((r) => {
-      const gross = r._sum.costPaise || 0;
+  const rows = Array.from(byVendor.entries())
+    .map(([vendorId, g]) => {
+      const gross = g.grossPaise;
       const commission = Math.round((gross * rate) / 100);
       return {
-        vendorId: r.vendorId,
-        name: r.vendorId ? shopName.get(r.vendorId) || "Unknown shop" : "Unassigned",
-        orders: r._count._all,
+        vendorId,
+        name: shopName.get(vendorId) || "Unknown shop",
+        orders: g.orderCount,
         grossPaise: gross,
         commissionPaise: commission,
         vendorNetPaise: gross - commission,
@@ -278,7 +274,7 @@ financeRouter.get("/commissions", async (_req, res) => {
     })
     .sort((a, b) => b.grossPaise - a.grossPaise);
 
-  const grossAll = total._sum.costPaise || 0;
+  const grossAll = total.grossPaise;
 
   res.json({
     ratePercent: rate,
@@ -287,7 +283,7 @@ financeRouter.get("/commissions", async (_req, res) => {
     grossPaise: grossAll,
     platformEarningsPaise: Math.round((grossAll * rate) / 100),
     vendorNetPaise: grossAll - Math.round((grossAll * rate) / 100),
-    orders: total._count._all,
+    orders: total.orderCount,
     byVendor: rows,
   });
 });
@@ -321,25 +317,25 @@ financeRouter.get("/payouts", async (_req, res) => {
         user: { select: { bankAccount: { select: { verified: true, accountNumber: true } } } },
       },
     }),
-    prisma.order.groupBy({ by: ["vendorId"], where: EARNED, _sum: { costPaise: true }, _count: { _all: true } }),
+    settlementGrossByVendor(),
     prisma.payout.groupBy({ by: ["vendorId"], where: { status: "PAID" }, _sum: { grossPaise: true } }),
   ]);
 
-  const earnedFor = new Map(earned.map((r) => [r.vendorId, r]));
+  const earnedFor = earned;
   const paidFor = new Map(paidOut.map((r) => [r.vendorId, r._sum.grossPaise || 0]));
 
   // What each shop is owed: everything they have earned, less what has already
   // been paid out to them. Computed rather than stored, so it can't drift.
   const outstanding = vendors
     .map((v) => {
-      const gross = earnedFor.get(v.id)?._sum.costPaise || 0;
+      const gross = earnedFor.get(v.id)?.grossPaise || 0;
       const already = paidFor.get(v.id) || 0;
       const pendingGross = Math.max(0, gross - already);
       const commission = Math.round((pendingGross * rate) / 100);
       return {
         vendorId: v.id,
         shopName: v.shopName,
-        orders: earnedFor.get(v.id)?._count._all || 0,
+        orders: earnedFor.get(v.id)?.orderCount || 0,
         earnedPaise: gross,
         alreadyPaidPaise: already,
         pendingGrossPaise: pendingGross,
@@ -402,13 +398,15 @@ financeRouter.post("/payouts", async (req: AuthedRequest, res) => {
     return res.status(409).json({ error: "This shop's bank account hasn't been verified yet." });
   }
 
-  const [earnedAgg, paidAgg, firstOrder] = await Promise.all([
-    prisma.order.aggregate({ _sum: { costPaise: true }, _count: { _all: true }, where: { ...EARNED, vendorId: vendor.id } }),
+  const [earned, paidAgg, firstOrder] = await Promise.all([
+    vendorSettlementGross(vendor.id),
     prisma.payout.aggregate({ _sum: { grossPaise: true }, where: { vendorId: vendor.id, status: "PAID" } }),
     prisma.order.findFirst({ where: { ...EARNED, vendorId: vendor.id }, orderBy: { createdAt: "asc" }, select: { createdAt: true } }),
   ]);
 
-  const gross = (earnedAgg._sum.costPaise || 0) - (paidAgg._sum.grossPaise || 0);
+  // Earned is net of the refunded portion of any partial print — the shop is
+  // paid only for pages that actually came out.
+  const gross = earned.grossPaise - (paidAgg._sum.grossPaise || 0);
   if (gross <= 0) {
     return res.status(409).json({ error: "Nothing outstanding for this shop." });
   }
@@ -422,7 +420,7 @@ financeRouter.post("/payouts", async (req: AuthedRequest, res) => {
       netPaise: gross - commission,
       periodStart: firstOrder?.createdAt || new Date(),
       periodEnd: new Date(),
-      orderCount: earnedAgg._count._all,
+      orderCount: earned.orderCount,
       note: parsed.data.note || null,
       createdById: req.user!.userId,
     },

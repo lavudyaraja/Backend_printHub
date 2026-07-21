@@ -10,8 +10,8 @@ import { prisma } from "../lib/prisma";
 import { requireAuth, requireRole, type AuthedRequest } from "../middleware/authGuard";
 import { requireVendorId, vendorIdFor, isVendorRole, isAdminRole } from "../lib/vendorScope";
 import { RATING_SELECT } from "../ratings/types";
-import { onboardVendor, refreshVendorRouteStatus } from "../lib/razorpayRoute";
 import { readSettings } from "../lib/settings";
+import { vendorSettlementGross } from "../lib/settlement";
 
 export const vendorsRouter = Router();
 
@@ -606,81 +606,16 @@ vendorsRouter.get("/me/customers/:userId", requireAuth, async (req: AuthedReques
   });
 });
 
-// ── Razorpay Route: onboarding and settlements ───────────────────────────────
+// ── Settlements ──────────────────────────────────────────────────────────────
 //
-// This is what lets a shop be paid directly. Once onboarded and activated by
-// Razorpay, every card/UPI order at the shop's printers is split at capture —
-// the shop's share settles straight to its own account, the platform keeps only
-// its commission, and nothing rests in a platform balance to be paid out by
-// hand. There is deliberately no "withdraw" here: withdrawing would mean the
-// platform held the money first, which is the whole thing Route avoids.
+// Payments are collected in full into the platform account; a shop's share is
+// settled to it afterwards by payout. This endpoint tells a shop what it has
+// earned (cost less commission across its completed orders, net of the refunded
+// portion of any partial print), what has already been paid out, and what is
+// still owed. There is no gateway onboarding here anymore — a bank account on
+// file is all a shop needs to be paid.
 
-/** Onboard, or re-check status. Uses the bank details already on file. */
-vendorsRouter.post("/me/route/onboard", requireAuth, async (req: AuthedRequest, res) => {
-  const vendorId = await requireVendorId(req, res);
-  if (!vendorId) return;
-
-  const [vendor, user] = await Promise.all([
-    prisma.vendor.findUnique({
-      where: { id: vendorId },
-      select: { shopName: true, contactName: true, mobileNumber: true },
-    }),
-    prisma.user.findUnique({
-      where: { id: req.user!.userId },
-      select: { email: true, phone: true, name: true, bankAccount: true },
-    }),
-  ]);
-
-  const bank = user?.bankAccount;
-  // Route pays into a bank account; without one there is nowhere for the shop's
-  // share to land, so onboarding can't even begin.
-  if (!bank) {
-    return res.status(409).json({
-      error: "Add your bank account first — that's where your share of each payment will be sent.",
-      code: "NO_BANK_ACCOUNT",
-    });
-  }
-  const email = user?.email;
-  const phone = user?.phone || vendor?.mobileNumber;
-  if (!email || !phone) {
-    return res.status(409).json({
-      error: "Add an email and phone number to your account before setting up payments.",
-      code: "MISSING_CONTACT",
-    });
-  }
-
-  try {
-    const result = await onboardVendor({
-      vendorId,
-      email,
-      phone,
-      legalBusinessName: vendor?.shopName || user?.name || "Print shop",
-      businessName: vendor?.shopName,
-      bank: {
-        accountHolder: bank.accountHolder,
-        accountNumber: bank.accountNumber,
-        ifsc: bank.ifsc,
-      },
-    });
-    res.json(result);
-  } catch (e: any) {
-    console.error("[route] onboard failed", e);
-    res.status(502).json({
-      error: e?.error?.description || "Couldn't set up payments with Razorpay. Please try again.",
-    });
-  }
-});
-
-/**
- * Live Route status plus what it has settled.
- *
- * The status is re-checked against Razorpay on every load, because KYC clears
- * on their side with no event we necessarily saw — a shop that onboarded while
- * pending becomes active later, and this is where it finds out. Settlement
- * figures are derived from this shop's own routed orders, not from a payout
- * table, because with Route there is no payout to record: the money already
- * moved.
- */
+/** What this shop has earned, been paid, and is still owed. */
 vendorsRouter.get("/me/route/status", requireAuth, async (req: AuthedRequest, res) => {
   const vendorId = await requireVendorId(req, res);
   if (!vendorId) return;
@@ -688,46 +623,36 @@ vendorsRouter.get("/me/route/status", requireAuth, async (req: AuthedRequest, re
   const vendor = await prisma.vendor.findUnique({
     where: { id: vendorId },
     select: {
-      razorpayAccountId: true, routeActive: true, routeStatusNote: true,
       user: { select: { bankAccount: { select: { accountHolder: true, accountNumber: true, ifsc: true, bankName: true } } } },
     },
-  });
-
-  // A live re-check, so the shop sees its real activation state, not a stale one.
-  if (vendor?.razorpayAccountId) {
-    await refreshVendorRouteStatus(vendorId).catch(() => {});
-  }
-
-  const fresh = await prisma.vendor.findUnique({
-    where: { id: vendorId },
-    select: { razorpayAccountId: true, routeActive: true, routeStatusNote: true },
   });
 
   const settings = await readSettings();
   const rate = settings.pricing?.commissionPercent ?? 0;
 
-  // What has actually been routed to this shop — every completed order that
-  // carried a Route transfer. Commission is computed at the current rate for
-  // display; the authoritative figure is whatever Razorpay actually split.
-  const [settledAgg, recent] = await Promise.all([
-    prisma.order.aggregate({
-      where: { vendorId, status: "COMPLETED", razorpayTransferId: { not: null } },
-      _sum: { costPaise: true },
+  const [earned, paidAgg, recent] = await Promise.all([
+    vendorSettlementGross(vendorId),
+    prisma.payout.aggregate({
+      where: { vendorId, status: "PAID" },
+      _sum: { netPaise: true },
       _count: { _all: true },
     }),
     prisma.order.findMany({
-      where: { vendorId, razorpayTransferId: { not: null } },
+      where: { vendorId, status: "COMPLETED" },
       orderBy: { createdAt: "desc" },
       take: 50,
       select: {
-        id: true, orderCode: true, costPaise: true, status: true, createdAt: true,
+        id: true, orderCode: true, costPaise: true, settlementPaise: true,
+        printedPages: true, pagesToPrint: true, status: true, createdAt: true,
         paymentMethod: true,
       },
     }),
   ]);
 
-  const gross = settledAgg._sum.costPaise || 0;
+  const gross = earned.grossPaise;
   const commission = Math.round((gross * rate) / 100);
+  const net = gross - commission;
+  const paidOut = paidAgg._sum.netPaise || 0;
 
   // Bank account, last four only — the shop confirms money is heading to the
   // right place without the full number ever leaving the server.
@@ -742,19 +667,144 @@ vendorsRouter.get("/me/route/status", requireAuth, async (req: AuthedRequest, re
     : null;
 
   res.json({
-    onboarded: !!fresh?.razorpayAccountId,
-    active: !!fresh?.routeActive,
-    statusNote: fresh?.routeStatusNote || null,
+    // A bank account on file is all onboarding is now; the platform settles the
+    // rest, so a shop with a bank account is "active" for payouts.
+    onboarded: !!bank,
+    active: !!bank,
+    statusNote: bank
+      ? null
+      : "Add your bank account so the platform can settle your earnings to you.",
     commissionPercent: rate,
     bank: maskedBank,
     settlements: {
-      routedOrders: settledAgg._count._all,
+      completedOrders: earned.orderCount,
       grossPaise: gross,
       commissionPaise: commission,
-      netPaise: gross - commission,
+      netPaise: net,
+      paidOutPaise: paidOut,
+      pendingPaise: Math.max(0, net - paidOut),
+      payoutCount: paidAgg._count._all,
     },
     recent,
   });
+});
+
+// ── KYC ──────────────────────────────────────────────────────────────────────
+// The shop submits who it is (legal name + PAN/Aadhaar/GST numbers) so the
+// platform can verify it before paying it. Numbers only — no document images.
+// Submitting puts the shop "under review"; an admin approving it on the
+// verifications queue is the same act as verifying the shop (verifiedAt).
+
+const panRe = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
+const gstinRe = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]$/;
+
+const kycSchema = z.object({
+  legalName: z.string().trim().min(2, "Enter the legal name as printed on your PAN."),
+  panNumber: z
+    .string()
+    .trim()
+    .transform((s) => s.toUpperCase())
+    .refine((s) => panRe.test(s), "Enter a valid 10-character PAN (e.g. ABCDE1234F)."),
+  aadhaarNumber: z
+    .string()
+    .trim()
+    .transform((s) => s.replace(/\s+/g, ""))
+    .refine((s) => /^[0-9]{12}$/.test(s), "Aadhaar must be 12 digits."),
+  gstin: z
+    .string()
+    .trim()
+    .transform((s) => s.toUpperCase())
+    .refine((s) => s === "" || gstinRe.test(s), "Enter a valid 15-character GSTIN, or leave it blank.")
+    .optional()
+    .or(z.literal("")),
+});
+
+/** Derive the KYC/verification state from the timestamps. */
+function kycStatus(v: {
+  verifiedAt: Date | null;
+  rejectedAt: Date | null;
+  kycSubmittedAt: Date | null;
+}): "VERIFIED" | "REJECTED" | "UNDER_REVIEW" | "NOT_SUBMITTED" {
+  if (v.verifiedAt) return "VERIFIED";
+  if (v.rejectedAt) return "REJECTED";
+  if (v.kycSubmittedAt) return "UNDER_REVIEW";
+  return "NOT_SUBMITTED";
+}
+
+/** The shop's own KYC, with the bank account it will be paid into. */
+vendorsRouter.get("/me/kyc", requireAuth, async (req: AuthedRequest, res) => {
+  const vendorId = await requireVendorId(req, res);
+  if (!vendorId) return;
+
+  const vendor = await prisma.vendor.findUnique({
+    where: { id: vendorId },
+    select: {
+      legalName: true, panNumber: true, aadhaarNumber: true, gstin: true,
+      kycSubmittedAt: true, verifiedAt: true, rejectedAt: true, verificationNote: true,
+      user: { select: { bankAccount: { select: { accountHolder: true, accountNumber: true, ifsc: true, bankName: true, verified: true } } } },
+    },
+  });
+  if (!vendor) return res.status(404).json({ error: "Shop not found" });
+
+  const bank = vendor.user?.bankAccount;
+  res.json({
+    status: kycStatus(vendor),
+    legalName: vendor.legalName,
+    panNumber: vendor.panNumber,
+    aadhaarNumber: vendor.aadhaarNumber,
+    gstin: vendor.gstin,
+    note: vendor.verificationNote,
+    submittedAt: vendor.kycSubmittedAt,
+    verifiedAt: vendor.verifiedAt,
+    rejectedAt: vendor.rejectedAt,
+    bank: bank
+      ? { accountHolder: bank.accountHolder, last4: bank.accountNumber.slice(-4), ifsc: bank.ifsc, bankName: bank.bankName, verified: bank.verified }
+      : null,
+  });
+});
+
+/** Submit or update KYC. Puts the shop back under review. */
+vendorsRouter.put("/me/kyc", requireAuth, async (req: AuthedRequest, res) => {
+  const vendorId = await requireVendorId(req, res);
+  if (!vendorId) return;
+
+  const parsed = kycSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.errors[0]?.message || "Invalid KYC details" });
+  }
+
+  // The bank account is the "bank proof" leg of KYC — there's no point verifying
+  // an identity we can't pay, so it must be on file before KYC can be submitted.
+  const bank = await prisma.bankAccount.findUnique({
+    where: { userId: req.user!.userId },
+    select: { id: true },
+  });
+  if (!bank) {
+    return res.status(409).json({
+      error: "Add your bank account first — it's the bank proof for your KYC.",
+      code: "NO_BANK_ACCOUNT",
+    });
+  }
+
+  const d = parsed.data;
+  const vendor = await prisma.vendor.update({
+    where: { id: vendorId },
+    data: {
+      legalName: d.legalName,
+      panNumber: d.panNumber,
+      aadhaarNumber: d.aadhaarNumber,
+      gstin: d.gstin ? d.gstin : null,
+      kycSubmittedAt: new Date(),
+      // A resubmission is a fresh review: clear any prior decision so the shop
+      // doesn't stay "rejected" (or wrongly "verified") on edited details.
+      verifiedAt: null,
+      rejectedAt: null,
+      verificationNote: null,
+    },
+    select: { verifiedAt: true, rejectedAt: true, kycSubmittedAt: true },
+  });
+
+  res.json({ status: kycStatus(vendor), submittedAt: vendor.kycSubmittedAt });
 });
 
 // ── Operating hours ──────────────────────────────────────────────────────────

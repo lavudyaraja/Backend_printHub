@@ -13,7 +13,6 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { priceInPoints } from "../lib/points";
-import { reverseTransferForOrder } from "../lib/razorpayRoute";
 import { REFUND_REASON_LABEL, type RefundReason } from "./types";
 
 export interface IssueRefundInput {
@@ -128,27 +127,10 @@ export async function issueRefund(input: IssueRefundInput): Promise<IssueRefundR
       return created;
     });
 
-    // Pull the shop's share back out of their linked account.
-    //
-    // The customer has already been credited above, from the platform's Points
-    // ledger. For a routed order the shop was paid its share at capture, so
-    // without this reversal the platform would eat the refund while the shop
-    // kept the money. Best-effort and outside the transaction: a failure here
-    // must not undo the customer's credit — it is a reconciliation problem, not
-    // a reason to leave a jammed print unrefunded — so it is logged loudly for
-    // ops rather than thrown.
-    try {
-      const reversed = await reverseTransferForOrder(order.id);
-      if (reversed) {
-        console.log(`[refund] reversed Route transfer for ${order.orderCode}`);
-      }
-    } catch (e) {
-      console.error(
-        `[refund] REVERSAL FAILED for ${order.orderCode} — customer was refunded but the shop's share was not clawed back. Reconcile manually.`,
-        e
-      );
-    }
-
+    // No gateway leg to reverse: the full amount was collected into the platform
+    // account, not split to the shop. The customer is credited from the platform
+    // ledger above, and the shop simply never earns on a refunded order — the
+    // settlement query excludes it. Nothing to claw back.
     return { ok: true, refundId: refund.id, pointsCredited };
   } catch (e) {
     // Two callers raced and the other one won. The order is refunded either
@@ -166,6 +148,137 @@ export async function issueRefund(input: IssueRefundInput): Promise<IssueRefundR
           pointsCredited: existing.pointsCredited,
           alreadyRefunded: true,
         };
+      }
+    }
+    throw e;
+  }
+}
+
+export type PartialRefundResult =
+  | { ok: true; refundId: string; pointsCredited: number; settlementPaise: number; kind: "partial" | "full" | "none" }
+  | { ok: false; error: string; status: number };
+
+/**
+ * Refund the unprinted part of an interrupted print, pro-rata by pages.
+ *
+ * The customer paid for `pagesToPrint`; the printer stopped after `printedPages`
+ * (a power cut, a jam). The pages that never came out are refunded to the
+ * customer as Points, and the order's `settlementPaise` is set to the printed
+ * portion — which is all the shop earns on it. The split is by page count, so
+ * 6 of 10 pages leaves the shop 6/10 of the cost and refunds the customer 4/10.
+ *
+ * Delegates the extremes to `issueRefund`: nothing printed is a full refund,
+ * everything printed is no refund at all. Idempotent through the same unique
+ * `Refund.orderId` constraint — a second call reports the refund already made.
+ */
+export async function issuePartialRefund(
+  orderId: string,
+  printedPages: number
+): Promise<PartialRefundResult> {
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    select: {
+      id: true, userId: true, orderCode: true, costPaise: true, status: true,
+      pagesToPrint: true, refund: { select: { id: true, pointsCredited: true } },
+      settlementPaise: true,
+    },
+  });
+  if (!order) return { ok: false, error: "Order not found.", status: 404 };
+
+  if (order.refund) {
+    return {
+      ok: true,
+      refundId: order.refund.id,
+      pointsCredited: order.refund.pointsCredited,
+      settlementPaise: order.settlementPaise ?? 0,
+      kind: "partial",
+    };
+  }
+
+  const total = Math.max(1, order.pagesToPrint);
+  const printed = Math.max(0, Math.min(printedPages, total));
+
+  // Nothing came out — a full refund, and the shop earns nothing.
+  if (printed <= 0) {
+    const res = await issueRefund({ orderId, reason: "PRINTER_STUCK", origin: "AUTOMATIC" });
+    if (!res.ok) return res;
+    await prisma.order.update({ where: { id: order.id }, data: { printedPages: 0, settlementPaise: 0 } });
+    return { ok: true, refundId: res.refundId, pointsCredited: res.pointsCredited, settlementPaise: 0, kind: "full" };
+  }
+
+  // Everything printed — nothing to refund, the shop earns the full cost.
+  if (printed >= total) {
+    await prisma.order.update({
+      where: { id: order.id },
+      data: { printedPages: total, settlementPaise: order.costPaise },
+    });
+    return { ok: true, refundId: "", pointsCredited: 0, settlementPaise: order.costPaise, kind: "none" };
+  }
+
+  // Refund the unprinted share. Ceil the refund so a rounding sub-paise lands in
+  // the customer's favour, not the platform's — the same bias issueRefund uses.
+  const refundPaise = Math.ceil((order.costPaise * (total - printed)) / total);
+  const settlementPaise = order.costPaise - refundPaise;
+  const pointsCredited = priceInPoints(refundPaise);
+
+  try {
+    const refund = await prisma.$transaction(async (tx) => {
+      const user = await tx.user.update({
+        where: { id: order.userId },
+        data: { pointsBalance: { increment: pointsCredited } },
+        select: { pointsBalance: true },
+      });
+
+      await tx.pointsTransaction.create({
+        data: {
+          userId: order.userId,
+          type: "CREDIT",
+          amountPoints: pointsCredited,
+          balancePoints: user.pointsBalance,
+          description: `Partial print — refund for ${total - printed} of ${total} unprinted page(s) on ${order.orderCode}`,
+          orderId: order.id,
+        },
+      });
+
+      const created = await tx.refund.create({
+        data: {
+          orderId: order.id,
+          userId: order.userId,
+          amountPaise: refundPaise,
+          pointsCredited,
+          reason: "PARTIAL_PRINT",
+          origin: "AUTOMATIC",
+          note: `${printed} of ${total} pages printed; ${total - printed} refunded.`,
+        },
+        select: { id: true },
+      });
+
+      await tx.order.update({
+        where: { id: order.id },
+        data: { printedPages: printed, settlementPaise },
+      });
+
+      await tx.notification.create({
+        data: {
+          userId: order.userId,
+          title: "Partial refund to your Points",
+          body: `Only ${printed} of ${total} pages printed on ${order.orderCode}. ${pointsCredited} points for the ${total - printed} unprinted page(s) have been added back to your balance.`,
+          orderId: order.id,
+        },
+      });
+
+      return created;
+    });
+
+    return { ok: true, refundId: refund.id, pointsCredited, settlementPaise, kind: "partial" };
+  } catch (e) {
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+      const existing = await prisma.refund.findUnique({
+        where: { orderId },
+        select: { id: true, pointsCredited: true },
+      });
+      if (existing) {
+        return { ok: true, refundId: existing.id, pointsCredited: existing.pointsCredited, settlementPaise, kind: "partial" };
       }
     }
     throw e;

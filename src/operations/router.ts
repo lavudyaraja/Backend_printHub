@@ -194,7 +194,9 @@ operationsRouter.get("/verifications", async (_req, res) => {
       select: {
         id: true, shopName: true, contactName: true, mobileNumber: true,
         verifiedAt: true, rejectedAt: true, verificationNote: true, createdAt: true,
-        user: { select: { id: true, name: true, email: true } },
+        // KYC the shop submitted, for the reviewer to check against.
+        legalName: true, panNumber: true, aadhaarNumber: true, gstin: true, kycSubmittedAt: true,
+        user: { select: { id: true, name: true, email: true, bankAccount: { select: { accountHolder: true, ifsc: true, bankName: true, verified: true } } } },
         _count: { select: { printers: true, orders: true } },
       },
     }),
@@ -258,8 +260,22 @@ operationsRouter.patch("/verifications/shop/:id", async (req: AuthedRequest, res
       verifiedById: req.user!.userId,
       verificationNote: parsed.data.note || null,
     },
-    select: { id: true, shopName: true, verifiedAt: true, rejectedAt: true },
+    select: { id: true, shopName: true, verifiedAt: true, rejectedAt: true, userId: true },
   });
+
+  // Tell the shop the KYC outcome — this is what lands in their console's bell.
+  await prisma.notification
+    .create({
+      data: {
+        userId: vendor.userId,
+        title: approve ? "KYC approved — you're verified" : "KYC needs attention",
+        body: approve
+          ? "Your shop has been verified. You're all set to take orders and receive payouts."
+          : `Your KYC was not approved${parsed.data.note ? `: ${parsed.data.note}` : "."} Please review your details and resubmit.`,
+      },
+    })
+    .catch(() => {});
+
   res.json({ vendor });
 });
 

@@ -19,9 +19,46 @@ function generatePrinterId() {
   return "PRN-" + nanoid(6).toUpperCase();
 }
 
-async function generateQR(printerId: string): Promise<{ qrData: string; qrCode: string }> {
-  const appUrl = process.env.APP_URL || "https://prinsta.app";
-  const qrData = `${appUrl}/connect?printer=${printerId}`;
+/**
+ * Escape the characters the WIFI: QR format treats as delimiters, so an SSID or
+ * password containing `;`, `:`, `,`, `"` or `\` still decodes cleanly. The app's
+ * parser (printerQr.ts) unescapes the same set.
+ */
+function escapeWifiValue(v: string): string {
+  return v.replace(/([\\;,:"])/g, "\\$1");
+}
+
+interface QrSource {
+  uniquePrinterId: string;
+  wifiSsid?: string | null;
+  accessPassword?: string | null;
+}
+
+/**
+ * Build a printer's QR.
+ *
+ * When the machine has Wi-Fi Direct details, the QR is a *standard Wi-Fi QR*
+ * (`WIFI:S:…;T:WPA;P:…;;`) — the app reads it, joins the printer's own network
+ * and prints straight away, with no backend round-trip and nothing to type. This
+ * is what makes "scan → connected → print" work from the sticker we generate,
+ * not only from the printer's factory sticker.
+ *
+ * A printer with no network details yet falls back to the identity URL, so a
+ * half-registered machine still gets a scannable code rather than none.
+ */
+async function generateQR(src: QrSource): Promise<{ qrData: string; qrCode: string }> {
+  let qrData: string;
+  if (src.wifiSsid) {
+    const ssid = escapeWifiValue(src.wifiSsid);
+    qrData = src.accessPassword
+      ? `WIFI:T:WPA;S:${ssid};P:${escapeWifiValue(src.accessPassword)};;`
+      : `WIFI:T:nopass;S:${ssid};;`;
+  } else {
+    // No network details (only possible on legacy rows regenerated in bulk). A
+    // domain-free identity string — never a URL, so it can't point at anything
+    // undeployed — kept only so such a printer still gets *some* scannable code.
+    qrData = `PRINSTA:PRINTER:${src.uniquePrinterId}`;
+  }
   const qrCode = await QRCode.toDataURL(qrData, {
     width: 300,
     margin: 2,
@@ -37,7 +74,9 @@ const printerSchema = z.object({
   serialNumber: z.string().optional(),
   ipAddress: z.string().min(7),
   macAddress: z.string().optional(),
-  wifiSsid: z.string().optional(),
+  // Required: the QR is the printer's Wi-Fi Direct network, so a machine with no
+  // SSID would get a QR that can't connect. Enforced here so it can't happen.
+  wifiSsid: z.string().min(2, "The printer's Wi-Fi Direct name (SSID) is required."),
   accessPassword: z.string().optional(),
   locationName: z.string().min(2),
   shopName: z.string().min(2),
@@ -196,7 +235,11 @@ printersRouter.post("/", requireAuth, async (req: AuthedRequest, res) => {
   }
 
   const uniquePrinterId = generatePrinterId();
-  const { qrData, qrCode } = await generateQR(uniquePrinterId);
+  const { qrData, qrCode } = await generateQR({
+    uniquePrinterId,
+    wifiSsid: data.wifiSsid,
+    accessPassword: data.accessPassword,
+  });
 
   const printer = await prisma.printer.create({
     data: {
@@ -251,6 +294,25 @@ printersRouter.put("/:id", requireAuth, async (req: AuthedRequest, res) => {
     }
   }
 
+  // A changed SSID or password makes the old QR connect to nothing, so rebuild it
+  // from the machine's new details. Merged with what's on file, since either
+  // field may be edited alone.
+  let qrUpdate: { qrData: string; qrCode: string } | null = null;
+  if (data.wifiSsid !== undefined || data.accessPassword !== undefined) {
+    const current = await prisma.printer.findUnique({
+      where: { id: req.params.id },
+      select: { uniquePrinterId: true, wifiSsid: true, accessPassword: true },
+    });
+    if (current) {
+      qrUpdate = await generateQR({
+        uniquePrinterId: current.uniquePrinterId,
+        wifiSsid: data.wifiSsid !== undefined ? data.wifiSsid || null : current.wifiSsid,
+        accessPassword:
+          data.accessPassword !== undefined ? data.accessPassword || null : current.accessPassword,
+      });
+    }
+  }
+
   try {
     const printer = await prisma.printer.update({
       where: { id: req.params.id },
@@ -276,6 +338,7 @@ printersRouter.put("/:id", requireAuth, async (req: AuthedRequest, res) => {
         ...(data.costPerColorPagePaise !== undefined ? { costPerColorPagePaise: data.costPerColorPagePaise } : {}),
         ...(data.status !== undefined ? { status: data.status } : {}),
         ...(data.locationId !== undefined ? { locationId: data.locationId || null } : {}),
+        ...(qrUpdate ? { qrData: qrUpdate.qrData, qrCode: qrUpdate.qrCode } : {}),
       },
     });
     res.json({ printer });
@@ -285,14 +348,41 @@ printersRouter.put("/:id", requireAuth, async (req: AuthedRequest, res) => {
   }
 });
 
-// ── Regenerate QR ─────────────────────────────────────────────────────────────
+// ── Regenerate every owned printer's QR ───────────────────────────────────────
+// One tap to reissue the whole estate's codes after the Wi-Fi-QR format change,
+// so existing stickers start connecting instead of needing each printer edited.
+// Declared before /:id/regenerate-qr is irrelevant (different path), but kept
+// above it for readability. Admins reissue platform-wide; a vendor, their own.
+printersRouter.post("/regenerate-all-qr", requireAuth, async (req: AuthedRequest, res) => {
+  const scope = isAdminRole(req.user?.role) ? {} : await ownedPrinterFilter(req);
+  if (!scope) return res.status(403).json({ error: "This is a vendor-only action." });
+
+  const printers = await prisma.printer.findMany({
+    where: scope,
+    select: { id: true, uniquePrinterId: true, wifiSsid: true, accessPassword: true },
+  });
+
+  let updated = 0;
+  for (const p of printers) {
+    const { qrData, qrCode } = await generateQR(p);
+    await prisma.printer.update({ where: { id: p.id }, data: { qrData, qrCode } });
+    updated += 1;
+  }
+  res.json({ updated, total: printers.length });
+});
+
+// ── Regenerate one printer's QR ───────────────────────────────────────────────
 printersRouter.post("/:id/regenerate-qr", requireAuth, async (req: AuthedRequest, res) => {
   if (!(await assertCanManagePrinter(req, res, req.params.id))) return;
 
   const printer = await prisma.printer.findUnique({ where: { id: req.params.id } });
   if (!printer) return res.status(404).json({ error: "Printer not found" });
 
-  const { qrData, qrCode } = await generateQR(printer.uniquePrinterId);
+  const { qrData, qrCode } = await generateQR({
+    uniquePrinterId: printer.uniquePrinterId,
+    wifiSsid: printer.wifiSsid,
+    accessPassword: printer.accessPassword,
+  });
   const updated = await prisma.printer.update({
     where: { id: req.params.id },
     data: { qrData, qrCode },

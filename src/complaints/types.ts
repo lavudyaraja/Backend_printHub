@@ -47,6 +47,12 @@ export const ACCEPTED_IMAGE_MIMES = [
 
 // The body arrives as multipart/form-data alongside the photos, so every field
 // is a string on the wire — hence coercion rather than plain types.
+/** Multipart sends booleans as the strings "true"/"false" (or "1"/"0"). */
+const booleanish = z
+  .union([z.boolean(), z.string()])
+  .optional()
+  .transform((v) => v === true || v === "true" || v === "1");
+
 export const createComplaintSchema = z.object({
   category: z.enum(COMPLAINT_CATEGORIES),
   subject: z.string().trim().max(120).optional(),
@@ -57,6 +63,9 @@ export const createComplaintSchema = z.object({
     .max(2000),
   orderId: z.string().trim().min(1).optional(),
   printerId: z.string().trim().min(1).optional(),
+  /// The customer wants their money back for the attached order. Only honoured
+  /// when an order is actually attached — a refund needs something to refund.
+  refundRequested: booleanish,
 });
 
 export type CreateComplaintInput = z.infer<typeof createComplaintSchema>;
@@ -69,13 +78,17 @@ export const COMPLAINT_SELECT = {
   subject: true,
   description: true,
   status: true,
+  refundRequested: true,
+  forwardedAt: true,
+  forwardNote: true,
+  refundId: true,
   resolution: true,
   resolvedAt: true,
   createdAt: true,
   updatedAt: true,
   orderId: true,
   printerId: true,
-  order: { select: { id: true, orderCode: true, status: true } },
+  order: { select: { id: true, orderCode: true, status: true, costPaise: true } },
   printer: { select: { id: true, name: true, shopName: true, locationName: true } },
   photos: { select: { id: true, fileName: true, mimeType: true, sizeBytes: true } },
 } as const;

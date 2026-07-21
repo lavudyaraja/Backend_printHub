@@ -28,11 +28,11 @@ enum Role {
 
 enum OrderStatus {
   PENDING_PAYMENT // awaiting payment
-  PAID            // payment confirmed
-  READY           // file ready, queued for printer
-  PRINTING        // actively printing
-  COMPLETED       // print delivered
-  FAILED          // print failed
+  PAID // payment confirmed
+  READY // file ready, queued for printer
+  PRINTING // actively printing
+  COMPLETED // print delivered
+  FAILED // print failed
   CANCELLED
 }
 
@@ -69,20 +69,24 @@ enum PrintJobStatus {
 /// standing at a jammed printer should be able to pick in one tap.
 enum ComplaintCategory {
   PRINTER_NOT_WORKING // machine dead, won't wake, errored mid-job
-  OUT_OF_TONER        // faded, streaked or blank-ish output from a dry cartridge
+  OUT_OF_TONER // faded, streaked or blank-ish output from a dry cartridge
   PAPER_JAM
   OUT_OF_PAPER
-  POOR_PRINT_QUALITY  // smudged, skewed, wrong colours
-  INCOMPLETE_PRINT    // some pages missing / job stopped part-way
-  BLANK_PAGES         // sheets came out empty
-  PAYMENT_OR_POINTS   // charged but nothing printed, points not refunded
+  POOR_PRINT_QUALITY // smudged, skewed, wrong colours
+  INCOMPLETE_PRINT // some pages missing / job stopped part-way
+  BLANK_PAGES // sheets came out empty
+  PAYMENT_OR_POINTS // charged but nothing printed, points not refunded
   OTHER
 }
 
 enum ComplaintStatus {
   OPEN
   IN_REVIEW
+  /// The shop passed a refund-bearing issue up to the platform to decide.
+  FORWARDED
   RESOLVED
+  /// Staff granted the refund; a Refund row exists and points are back.
+  REFUNDED
   REJECTED
   /// Withdrawn by the user (e.g. the printer started working again).
   CANCELLED
@@ -90,7 +94,7 @@ enum ComplaintStatus {
 
 enum PointsTxnType {
   CREDIT // top-up / refund
-  DEBIT  // spent on a print order
+  DEBIT // spent on a print order
 
   @@map("WalletTxnType")
 }
@@ -98,12 +102,12 @@ enum PointsTxnType {
 /// Why an order was refunded. Coarse on purpose — it exists to explain the
 /// credit on the user's ledger, not to drive logic.
 enum RefundReason {
-  PRINT_FAILED      // the printer reported the job failed
-  PRINTER_STUCK     // job started and never finished — jam, freeze, power cut
-  PRINTER_OFFLINE   // machine went away before the job ran
-  PARTIAL_PRINT     // some pages came out, some didn't
+  PRINT_FAILED // the printer reported the job failed
+  PRINTER_STUCK // job started and never finished — jam, freeze, power cut
+  PRINTER_OFFLINE // machine went away before the job ran
+  PARTIAL_PRINT // some pages came out, some didn't
   CANCELLED_BY_USER
-  ADMIN_GOODWILL    // staff decision, e.g. after a complaint
+  ADMIN_GOODWILL // staff decision, e.g. after a complaint
   OTHER
 }
 
@@ -152,7 +156,7 @@ enum PayoutStatus {
 enum PaymentMethod {
   /// Paid from the user's Prinsta Points balance. The stored value is still
   /// "WALLET" so existing rows keep validating.
-  POINTS @map("WALLET")
+  POINTS      @map("WALLET")
   UPI
   CREDIT_CARD
   DEBIT_CARD
@@ -209,38 +213,38 @@ enum RatingStatus {
 // ------------------------------------------------------------------
 
 model User {
-  id                String   @id @default(cuid())
-  phone             String?  @unique
-  email             String?  @unique
-  googleId          String?  @unique
-  name              String
-  passwordHash      String?
-  rollNumber        String?  @unique
-  role              Role     @default(STUDENT)
+  id                 String   @id @default(cuid())
+  phone              String?  @unique
+  email              String?  @unique
+  googleId           String?  @unique
+  name               String
+  passwordHash       String?
+  rollNumber         String?  @unique
+  role               Role     @default(STUDENT)
   /// The live balance, in Prinsta Points (1 point = 10 paise — see lib/points.ts).
-  pointsBalance      Int     @default(0)
+  pointsBalance      Int      @default(0)
   /// Legacy paise balance. Superseded by pointsBalance and no longer written to.
   /// Kept because deploys use `prisma db push`, which would drop the column (and
   /// every existing balance with it) if this were renamed rather than added
   /// alongside. Safe to delete once scripts/backfill-points.ts has been run and
   /// the new balances verified in production.
-  pointsBalancePaise Int     @default(0) @map("walletBalancePaise")
-  emailNotifications Boolean @default(true) // receive order + login emails
-  loginAlertSent    Boolean  @default(false) // the "new login" email is sent once, not every sign-in
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  pointsBalancePaise Int      @default(0) @map("walletBalancePaise")
+  emailNotifications Boolean  @default(true) // receive order + login emails
+  loginAlertSent     Boolean  @default(false) // the "new login" email is sent once, not every sign-in
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
 
   /// This account's own code to share. Generated on first request rather than
   /// at sign-up, so accounts that predate referrals get one too.
-  referralCode       String?  @unique
+  referralCode       String?   @unique
   /// The account whose code this user entered. Set once and never changed —
   /// letting it move would let the reward be claimed repeatedly.
   referredById       String?
   /// Self-relation, so the operator console can list who invited whom without
   /// a second round of lookups. `SetNull` rather than cascade: deleting an
   /// inviter must not take their invitees' accounts with it.
-  referredBy         User?    @relation("UserReferrals", fields: [referredById], references: [id], onDelete: SetNull)
-  referrals          User[]   @relation("UserReferrals")
+  referredBy         User?     @relation("UserReferrals", fields: [referredById], references: [id], onDelete: SetNull)
+  referrals          User[]    @relation("UserReferrals")
   /// When the referral reward was paid out, for both sides. Its presence is
   /// what stops a second payout; the reward fires on the invited user's first
   /// completed order, and orders complete more than once over a lifetime.
@@ -249,12 +253,12 @@ model User {
   /// Set when an admin bans the account. Null means active — a nullable
   /// timestamp rather than a boolean so "when" and "whether" are one field and
   /// can't disagree.
-  bannedAt      DateTime?
+  bannedAt   DateTime?
   /// Shown to the user on the sign-in screen, so a ban isn't a silent failure.
-  banReason     String?
+  banReason  String?
   /// The admin who applied the ban. Not a relation: it points at another User
   /// row, and a self-relation here would need a back-reference that has no use.
-  bannedById    String?
+  bannedById String?
 
   /// Average of the VISIBLE stars shops have given this account, and how many
   /// there are. Denormalized: the vendor console shows a customer's standing
@@ -262,24 +266,24 @@ model User {
   /// on that path would put a scan of every past order in front of a checkout.
   /// Recomputed inside the same transaction as every rating write — see
   /// ratings/service.ts.
-  ratingAvg     Float    @default(0)
-  ratingCount   Int      @default(0)
+  ratingAvg   Float @default(0)
+  ratingCount Int   @default(0)
 
-  documents     Document[]
-  orders        Order[]
-  notifications Notification[]
-  pointsTxns    PointsTransaction[]
-  complaints    Complaint[]
-  refunds       Refund[]
-  bankAccount   BankAccount?
+  documents       Document[]
+  orders          Order[]
+  notifications   Notification[]
+  pointsTxns      PointsTransaction[]
+  complaints      Complaint[]
+  refunds         Refund[]
+  bankAccount     BankAccount?
   /// Ratings this account wrote — as a student about a shop, or, for a vendor
   /// login, about a customer.
-  ratingsWritten  Rating[] @relation("RatingAuthor")
+  ratingsWritten  Rating[]            @relation("RatingAuthor")
   /// Ratings shops have written about this account.
-  ratingsReceived Rating[] @relation("RatingSubjectUser")
+  ratingsReceived Rating[]            @relation("RatingSubjectUser")
   refundRequests  RefundRequest[]
   /// Set only for vendor-console accounts.
-  vendor        Vendor?
+  vendor          Vendor?
 
   @@index([phone])
   @@index([email])
@@ -310,19 +314,19 @@ model BankAccount {
 /// The Prinsta Points ledger. Renamed from WalletTransaction; `@@map` keeps
 /// the existing table so no data migration is required.
 model PointsTransaction {
-  id           String        @id @default(cuid())
-  userId       String
-  type         PointsTxnType
+  id            String        @id @default(cuid())
+  userId        String
+  type          PointsTxnType
   /// Points moved by this transaction, and the resulting balance.
-  amountPoints  Int          @default(0)
-  balancePoints Int          @default(0)
+  amountPoints  Int           @default(0)
+  balancePoints Int           @default(0)
   /// Legacy paise figures — see the note on User.pointsBalancePaise.
-  amountPaise  Int          @default(0)
-  balancePaise Int          @default(0)
-  description  String
-  orderId      String?
-  razorpayId   String?       // Razorpay payment ID
-  createdAt    DateTime      @default(now())
+  amountPaise   Int           @default(0)
+  balancePaise  Int           @default(0)
+  description   String
+  orderId       String?
+  razorpayId    String? // Razorpay payment ID
+  createdAt     DateTime      @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -347,33 +351,33 @@ model Notification {
 }
 
 model Document {
-  id        String   @id @default(cuid())
+  id        String    @id @default(cuid())
   userId    String
   fileName  String
-  fileType  String   // pdf | docx | pptx | image
-  fileKey   String   // logical key (kept for compatibility)
-  mimeType  String?  // original upload content-type
-  fileData  Bytes?   // the file itself, stored in Neon (no external object storage)
+  fileType  String // pdf | docx | pptx | image
+  fileKey   String // logical key (kept for compatibility)
+  mimeType  String? // original upload content-type
+  fileData  Bytes? // the file itself, stored in Neon (no external object storage)
   sizeBytes Int
-  pageCount Int      @default(1)
-  deleted   Boolean  @default(false)
+  pageCount Int       @default(1)
+  deleted   Boolean   @default(false)
   /// Set when the user asks to keep a printed file instead of having it deleted
   /// straight away — the sweeper leaves the bytes alone until this passes. Null
   /// means no such request, which is the privacy-preserving default.
   keepUntil DateTime?
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
 
-  user  User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
   order Order?
 
   @@index([userId])
 }
 
 model Order {
-  id         String      @id @default(cuid())
-  orderCode  String      @unique        // e.g. PRT-8F3A2K
+  id         String  @id @default(cuid())
+  orderCode  String  @unique // e.g. PRT-8F3A2K
   userId     String
-  documentId String      @unique
+  documentId String  @unique
   printerId  String?
 
   // Copied from the printer at order time rather than joined through it. A
@@ -383,19 +387,28 @@ model Order {
   locationId String?
 
   // print configuration
-  colorMode      ColorMode @default(BW)
-  sideMode       SideMode  @default(SINGLE)
-  copies         Int       @default(1)
-  pageRange      String    @default("all")
-  pageColorModes String?
-  pagesToPrint   Int       @default(1)
-  paperSize      String    @default("A4")
-  costPaise      Int       @default(0)
+  colorMode       ColorMode @default(BW)
+  sideMode        SideMode  @default(SINGLE)
+  copies          Int       @default(1)
+  pageRange       String    @default("all")
+  pageColorModes  String?
+  pagesToPrint    Int       @default(1)
+  paperSize       String    @default("A4")
+  costPaise       Int       @default(0)
+  /// How many pages actually came out, when a print was interrupted (power cut,
+  /// jam, printer stuck). Null means it was never partial — a normal order
+  /// either printed in full or not at all.
+  printedPages    Int?
+  /// What this order settles to the vendor, in paise — the printed portion of a
+  /// partial print, or the full cost of a clean one. Null on older/normal orders
+  /// is read as the full costPaise; a partial print sets it to the earned share
+  /// after the customer's pro-rata refund. This is what payouts are drawn from.
+  settlementPaise Int?
 
   // payment
-  paymentMethod  PaymentMethod?
-  razorpayOrderId String?
-  razorpayPaymentId String?
+  paymentMethod      PaymentMethod?
+  razorpayOrderId    String?
+  razorpayPaymentId  String?
   /// The Route transfer (`trf_…`) that moved this order's share to the shop.
   /// Set only for a direct payment that was split at capture; null for Points
   /// orders (nothing was routed) and for orders taken before Route existed.
@@ -409,15 +422,15 @@ model Order {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  document Document  @relation(fields: [documentId], references: [id])
-  printer  Printer?  @relation(fields: [printerId], references: [id])
-  vendor   Vendor?   @relation(fields: [vendorId], references: [id], onDelete: SetNull)
-  location Location? @relation(fields: [locationId], references: [id], onDelete: SetNull)
-  printJob PrintJob?
-  complaints Complaint[]
-  refund     Refund?
-  ratings    Rating[]
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  document      Document       @relation(fields: [documentId], references: [id])
+  printer       Printer?       @relation(fields: [printerId], references: [id])
+  vendor        Vendor?        @relation(fields: [vendorId], references: [id], onDelete: SetNull)
+  location      Location?      @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  printJob      PrintJob?
+  complaints    Complaint[]
+  refund        Refund?
+  ratings       Rating[]
   refundRequest RefundRequest?
 
   @@index([userId])
@@ -432,27 +445,41 @@ model Order {
 /// which meant nothing could actually be scoped to an owner — every printer route
 /// had to be ADMIN-only because there was no way to ask "is this yours?".
 model Vendor {
-  id           String   @id @default(cuid())
-  userId       String   @unique
-  shopName     String
-  contactName  String?
-  mobileNumber String?
+  id               String    @id @default(cuid())
+  userId           String    @unique
+  shopName         String
+  contactName      String?
+  mobileNumber     String?
   /// Set when an operator has checked the shop out. Null means unverified;
   /// `verificationNote` carries the reason when a check is rejected.
-  verifiedAt   DateTime?
-  verifiedById String?
+  verifiedAt       DateTime?
+  verifiedById     String?
   verificationNote String?
   /// Set when a verification was explicitly turned down, so a rejected shop is
   /// distinguishable from one nobody has looked at yet.
-  rejectedAt   DateTime?
+  rejectedAt       DateTime?
+
+  // ── KYC ──
+  // What the shop submits so the platform can verify who it is paying. Numbers
+  // only (no document images); the admin checks these on the verifications
+  // queue, and approving there is the same act as verifying the shop.
+  /// Legal name as printed on the shop's PAN — may differ from the display name.
+  legalName      String?
+  panNumber      String?
+  aadhaarNumber  String?
+  /// GST registration number. Optional — small shops aren't GST-registered.
+  gstin          String?
+  /// When the shop last submitted KYC for review. Null means never submitted;
+  /// set with verifiedAt/rejectedAt both null means "under review".
+  kycSubmittedAt DateTime?
   /// Set when an admin bans the shop. While set, its printers are hidden from
   /// the app and take no new orders. Orders already paid for are left alone —
   /// the customer still needs their print, or their refund.
-  bannedAt     DateTime?
-  banReason    String?
-  bannedById   String?
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  bannedAt       DateTime?
+  banReason      String?
+  bannedById     String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
   /// The shop's Razorpay Route linked account (`acc_…`).
   ///
@@ -471,7 +498,7 @@ model Vendor {
   /// True once Razorpay has activated the linked account and it can actually
   /// receive transfers. An account can exist (`razorpayAccountId` set) while
   /// still pending KYC, during which it must not be sent money.
-  routeActive       Boolean  @default(false)
+  routeActive       Boolean @default(false)
   /// Last thing Razorpay told us about the account's onboarding — shown to the
   /// shop so a stuck KYC isn't a silent dead end.
   routeStatusNote   String?
@@ -480,8 +507,8 @@ model Vendor {
   /// there are. Denormalized because the app shows a star next to every printer
   /// on the pick-a-machine screen: computing it live would mean aggregating
   /// ratings for every vendor in range on each load of the busiest screen.
-  ratingAvg    Float    @default(0)
-  ratingCount  Int      @default(0)
+  ratingAvg   Float @default(0)
+  ratingCount Int   @default(0)
 
   /// When the shop is open, as `{ mon: { open: "09:00", close: "20:00",
   /// closed: false }, ... }` keyed by the seven short day names.
@@ -496,13 +523,14 @@ model Vendor {
   /// rather than as "closed all week".
   operatingHours Json?
 
-  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
-  locations Location[]
-  printers  Printer[]
-  orders    Order[]
-  payouts   Payout[]
-  ratings   Rating[]
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  locations      Location[]
+  printers       Printer[]
+  orders         Order[]
+  payouts        Payout[]
+  ratings        Rating[]
   refundRequests RefundRequest[]
+  complaints     Complaint[]
 }
 
 /// A physical place a vendor operates from — one vendor can run several.
@@ -513,7 +541,7 @@ model Vendor {
 model Location {
   id        String   @id @default(cuid())
   vendorId  String
-  name      String   // e.g. "MG Road branch"
+  name      String // e.g. "MG Road branch"
   address   String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -526,44 +554,44 @@ model Location {
 }
 
 model Printer {
-  id             String        @id @default(cuid())
-  uniquePrinterId String       @unique // e.g. PRN-AB12CD
+  id              String @id @default(cuid())
+  uniquePrinterId String @unique // e.g. PRN-AB12CD
 
   // Ownership. Nullable so `prisma db push` doesn't reject the existing rows,
   // which predate vendors; scripts/backfill-vendors.ts fills them in and an
   // admin can reassign anything it couldn't work out.
-  vendorId       String?
-  locationId     String?
+  vendorId   String?
+  locationId String?
 
   // Basic info
   name           String
-  brand          String        // Canon, HP, Epson, Brother, Samsung, Xerox, Other
+  brand          String // Canon, HP, Epson, Brother, Samsung, Xerox, Other
   model          String
   serialNumber   String?
   ipAddress      String
   macAddress     String?
-  wifiSsid       String?       // Wi-Fi Direct SSID the printer broadcasts, e.g. "DIRECT-Pantum-BP5100"
-  accessPassword String?       // Wi-Fi Direct join password (shared with the app to connect + print)
+  wifiSsid       String? // Wi-Fi Direct SSID the printer broadcasts, e.g. "DIRECT-Pantum-BP5100"
+  accessPassword String? // Wi-Fi Direct join password (shared with the app to connect + print)
 
   /// Set once an operator has confirmed this machine is real and reachable.
-  verifiedAt     DateTime?
-  verifiedById   String?
-  rejectedAt     DateTime?
+  verifiedAt       DateTime?
+  verifiedById     String?
+  rejectedAt       DateTime?
   verificationNote String?
 
   // Status
-  status         PrinterStatus @default(OFFLINE)
-  paperLevel     Int           @default(100) // %
-  tonerLevel     Int           @default(100) // %
-  lastSeenAt     DateTime?
+  status     PrinterStatus @default(OFFLINE)
+  paperLevel Int           @default(100) // %
+  tonerLevel Int           @default(100) // %
+  lastSeenAt DateTime?
 
   // Location & owner
-  locationName   String        // e.g. "Ground Floor - Shop 12"
-  shopName       String
-  ownerName      String
-  mobileNumber   String
-  emailAddress   String?
-  address        String?
+  locationName String // e.g. "Ground Floor - Shop 12"
+  shopName     String
+  ownerName    String
+  mobileNumber String
+  emailAddress String?
+  address      String?
 
   // Capabilities
   supportedPaperSizes String[] @default(["A4"]) // ["A4","A3","Letter"]
@@ -571,20 +599,20 @@ model Printer {
   duplexPrinting      Boolean  @default(false)
 
   // Pricing (in paise — 1 INR = 100 paise)
-  costPerBWPagePaise    Int    @default(200)  // ₹2.00
-  costPerColorPagePaise Int    @default(1000) // ₹10.00
+  costPerBWPagePaise    Int @default(200) // ₹2.00
+  costPerColorPagePaise Int @default(1000) // ₹10.00
 
   // QR code
-  qrCode   String?  // base64 PNG data URL
-  qrData   String?  // the URL encoded in the QR
+  qrCode String? // base64 PNG data URL
+  qrData String? // the URL encoded in the QR
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  vendor    Vendor?    @relation(fields: [vendorId], references: [id], onDelete: SetNull)
-  location  Location?  @relation(fields: [locationId], references: [id], onDelete: SetNull)
-  orders    Order[]
-  printJobs PrintJob[]
+  vendor     Vendor?     @relation(fields: [vendorId], references: [id], onDelete: SetNull)
+  location   Location?   @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  orders     Order[]
+  printJobs  PrintJob[]
   complaints Complaint[]
 
   @@index([status])
@@ -619,34 +647,52 @@ model PrintJob {
 /// account and usually to the specific order or printer that failed, which is
 /// what makes it actionable (and refundable) without a back-and-forth.
 model Complaint {
-  id         String            @id @default(cuid())
+  id              String            @id @default(cuid())
   /// Human-quotable reference, e.g. CMP-8F3A2K.
-  code       String            @unique
-  userId     String
+  code            String            @unique
+  userId          String
   /// The order that went wrong, when the user reported from an order.
-  orderId    String?
+  orderId         String?
   /// The machine involved. Kept even if the order is missing — a walk-up user
   /// can report a broken printer without having placed an order at all.
-  printerId  String?
-  category   ComplaintCategory
-  subject    String
-  description String
-  status     ComplaintStatus   @default(OPEN)
+  printerId       String?
+  /// The shop that owns the machine/order this is about. Copied at creation so
+  /// the vendor queue can be scoped without joining through the printer, and so
+  /// it survives the printer being reassigned. Null for platform-only issues
+  /// (payment/points) with no shop behind them — those stay in the admin queue.
+  vendorId        String?
+  category        ComplaintCategory
+  subject         String
+  description     String
+  status          ComplaintStatus   @default(OPEN)
+  /// The customer asked for their money back as part of this issue. A refund is
+  /// only ever issued by staff, after the shop forwards the issue on.
+  refundRequested Boolean           @default(false)
+  /// The shop passed this to the platform to decide. Refunds are admin-only, so
+  /// forwarding is the vendor's move on a refund it can't grant itself.
+  forwardedAt     DateTime?
+  /// The shop's note to staff when forwarding.
+  forwardNote     String?
+  /// The refund this issue produced, once staff granted it. Null until then.
+  refundId        String?           @unique
   /// Staff response, shown to the user on the complaint detail screen.
-  resolution String?
-  resolvedAt DateTime?
-  createdAt  DateTime          @default(now())
-  updatedAt  DateTime          @updatedAt
+  resolution      String?
+  resolvedAt      DateTime?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
 
   user    User             @relation(fields: [userId], references: [id], onDelete: Cascade)
   order   Order?           @relation(fields: [orderId], references: [id], onDelete: SetNull)
   printer Printer?         @relation(fields: [printerId], references: [id], onDelete: SetNull)
+  vendor  Vendor?          @relation(fields: [vendorId], references: [id], onDelete: SetNull)
   photos  ComplaintPhoto[]
 
   @@index([userId])
   @@index([userId, createdAt])
   @@index([status])
   @@index([printerId])
+  /// The shop's issue queue.
+  @@index([vendorId, status, createdAt])
 }
 
 /// One side's rating of the other, for one completed order.
@@ -669,22 +715,22 @@ model Rating {
   direction RatingDirection
 
   /// 1–5. Range is enforced in ratings/types.ts — Prisma has no check constraint.
-  stars     Int
+  stars   Int
   /// Free text, optional. A star with no words is still a rating.
-  comment   String?
+  comment String?
   /// Quick-pick reasons. Validated against the direction before it is written.
-  tags      RatingTag[]
+  tags    RatingTag[]
 
   /// Who wrote it. For USER_TO_VENDOR this is the student; for VENDOR_TO_USER
   /// it is the vendor's own login, so a shop that changes hands still shows who
   /// actually left the rating.
-  authorId  String
+  authorId String
   /// The student side of the order — the subject when VENDOR_TO_USER, and the
   /// author when USER_TO_VENDOR.
-  userId    String
+  userId   String
   /// The shop side of the order. Not nullable the way Order.vendorId is: a
   /// rating with no shop attached has nobody to be about.
-  vendorId  String
+  vendorId String
 
   status       RatingStatus @default(VISIBLE)
   /// Why staff hid it, shown in the moderation log. Null while VISIBLE.
@@ -723,21 +769,21 @@ model Rating {
 /// the console button can fire for the same failed order, so the database
 /// refuses the second one rather than trusting either caller to check first.
 model Refund {
-  id            String       @id @default(cuid())
-  orderId       String       @unique
-  userId        String
+  id             String       @id @default(cuid())
+  orderId        String       @unique
+  userId         String
   /// What the order cost, in paise — kept so the ledger still reconciles if
   /// the points rate is ever changed.
-  amountPaise   Int
+  amountPaise    Int
   /// What was actually credited back, in points.
   pointsCredited Int
-  reason        RefundReason
-  origin        RefundOrigin @default(AUTOMATIC)
+  reason         RefundReason
+  origin         RefundOrigin @default(AUTOMATIC)
   /// Free text from staff on a manual refund.
-  note          String?
+  note           String?
   /// The admin who issued a manual refund. Null for automatic ones.
-  issuedById    String?
-  createdAt     DateTime     @default(now())
+  issuedById     String?
+  createdAt      DateTime     @default(now())
 
   order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
   user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -757,16 +803,16 @@ model Refund {
 /// to keep asking the same shop until they give in; the way forward from a "no"
 /// is ESCALATED, which is the same row moving into the platform's queue.
 model RefundRequest {
-  id          String              @id @default(cuid())
+  id       String  @id @default(cuid())
   /// Human-quotable reference, e.g. RFR-8F3A2K.
-  code        String              @unique
-  orderId     String              @unique
-  userId      String
+  code     String  @unique
+  orderId  String  @unique
+  userId   String
   /// The shop that has to answer it. Copied from the order rather than joined
   /// through it, for the same reason Order.vendorId is copied off the printer —
   /// a machine can be sold, and the request still belongs to whoever took the
   /// money.
-  vendorId    String?
+  vendorId String?
 
   reason      RefundReason
   /// The customer's account of what went wrong, in their own words.
@@ -775,27 +821,27 @@ model RefundRequest {
 
   /// The vendor login that approved or rejected. Not a relation — it points at
   /// a User row and a back-reference here would have no use.
-  decidedById String?
-  decidedAt   DateTime?
+  decidedById  String?
+  decidedAt    DateTime?
   /// The shop's reason, shown to the customer. Required on a rejection: a "no"
   /// with no explanation is what makes people escalate.
   decisionNote String?
 
   /// Set when the customer disputes a rejection.
-  escalatedAt DateTime?
+  escalatedAt    DateTime?
   /// Why they think the shop got it wrong.
   escalationNote String?
   /// Staff's answer to the escalation.
-  staffNote   String?
-  resolvedById String?
-  resolvedAt  DateTime?
+  staffNote      String?
+  resolvedById   String?
+  resolvedAt     DateTime?
 
   /// The refund this became, once approved. Nullable because most requests
   /// never get here, and unique because one refund can't settle two requests.
-  refundId    String?             @unique
+  refundId String? @unique
 
-  createdAt   DateTime            @default(now())
-  updatedAt   DateTime            @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   order  Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
   user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -815,29 +861,29 @@ model RefundRequest {
 /// holds the bank's transaction id — this table is the record of what happened,
 /// not the thing that makes it happen.
 model Payout {
-  id            String       @id @default(cuid())
-  vendorId      String
+  id              String       @id @default(cuid())
+  vendorId        String
   /// Gross takings this payout covers, before the platform's cut.
-  grossPaise    Int
+  grossPaise      Int
   /// The platform's cut, at the rate in force when the payout was drawn up.
-  commissionPaise Int        @default(0)
+  commissionPaise Int          @default(0)
   /// What the vendor actually receives — gross less commission.
-  netPaise      Int
+  netPaise        Int
   /// The window this payout settles, so two payouts can't claim the same orders.
-  periodStart   DateTime
-  periodEnd     DateTime
+  periodStart     DateTime
+  periodEnd       DateTime
   /// How many completed orders it covers, for reconciliation.
-  orderCount    Int          @default(0)
-  status        PayoutStatus @default(PENDING)
+  orderCount      Int          @default(0)
+  status          PayoutStatus @default(PENDING)
   /// Bank/UPI transaction reference, once the transfer has been made.
-  reference     String?
+  reference       String?
   /// Why it failed, when it did.
-  failureReason String?
-  note          String?
-  createdById   String?
-  processedAt   DateTime?
-  createdAt     DateTime     @default(now())
-  updatedAt     DateTime     @updatedAt
+  failureReason   String?
+  note            String?
+  createdById     String?
+  processedAt     DateTime?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
 
   vendor Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
 
