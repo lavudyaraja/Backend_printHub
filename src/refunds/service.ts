@@ -13,12 +13,15 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { priceInPoints } from "../lib/points";
+import { reverseTransferForOrder } from "../lib/razorpayRoute";
 import { REFUND_REASON_LABEL, type RefundReason } from "./types";
 
 export interface IssueRefundInput {
   orderId: string;
   reason: RefundReason;
-  origin?: "AUTOMATIC" | "MANUAL";
+  /// VENDOR_APPROVED is a shop granting a customer's request from their own
+  /// console, with no staff involvement — see refundRequests/service.ts.
+  origin?: "AUTOMATIC" | "MANUAL" | "VENDOR_APPROVED";
   /** Staff note, for manual refunds. */
   note?: string;
   /** The admin issuing a manual refund. */
@@ -124,6 +127,27 @@ export async function issueRefund(input: IssueRefundInput): Promise<IssueRefundR
 
       return created;
     });
+
+    // Pull the shop's share back out of their linked account.
+    //
+    // The customer has already been credited above, from the platform's Points
+    // ledger. For a routed order the shop was paid its share at capture, so
+    // without this reversal the platform would eat the refund while the shop
+    // kept the money. Best-effort and outside the transaction: a failure here
+    // must not undo the customer's credit — it is a reconciliation problem, not
+    // a reason to leave a jammed print unrefunded — so it is logged loudly for
+    // ops rather than thrown.
+    try {
+      const reversed = await reverseTransferForOrder(order.id);
+      if (reversed) {
+        console.log(`[refund] reversed Route transfer for ${order.orderCode}`);
+      }
+    } catch (e) {
+      console.error(
+        `[refund] REVERSAL FAILED for ${order.orderCode} — customer was refunded but the shop's share was not clawed back. Reconcile manually.`,
+        e
+      );
+    }
 
     return { ok: true, refundId: refund.id, pointsCredited };
   } catch (e) {

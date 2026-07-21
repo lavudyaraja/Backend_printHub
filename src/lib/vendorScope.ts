@@ -24,16 +24,23 @@ export async function vendorIdFor(userId: string): Promise<string | null> {
 }
 
 /**
- * Resolve the caller's vendor, replying 403 and returning null when they aren't
- * a vendor at all. Callers should return immediately on null.
+ * Resolve the caller's own vendor, replying 403 and returning null only when the
+ * caller has no business in the vendor console at all. Callers should return
+ * immediately on null.
  *
- * An account with no Vendor row gets one here rather than an error: accounts
- * created before vendors existed, and any the backfill couldn't reach, would
- * otherwise be locked out of their own console with nothing they could do about
- * it. Creating a shop profile for your own account is not a privileged act.
+ * Both vendors and admins reach the vendor console — a vendor to run their shop,
+ * an admin to look in and, often, because an admin runs a shop too. Either way
+ * the per-shop pages act on the caller's *own* Vendor row, so both get one
+ * resolved (and auto-created if missing). Creating a shop profile for your own
+ * account is not a privileged act, and an admin operating their own shop in the
+ * vendor console is the same shape as a vendor doing so — platform-wide views
+ * live in the admin console, not here.
+ *
+ * Only a plain student (no console role) is turned away.
  */
 export async function requireVendorId(req: AuthedRequest, res: Response): Promise<string | null> {
-  if (!isVendorRole(req.user?.role)) {
+  const role = req.user?.role;
+  if (!isVendorRole(role) && !isAdminRole(role)) {
     res.status(403).json({ error: "This is a vendor-only action." });
     return null;
   }
@@ -53,6 +60,41 @@ export async function requireVendorId(req: AuthedRequest, res: Response): Promis
     select: { id: true },
   });
   return created.id;
+}
+
+/**
+ * The caller's *own* vendor id, or null — without writing a 403.
+ *
+ * The difference from `requireVendorId` is that this never ends the response, so
+ * a route can decide for itself what "you have no shop" should look like. A
+ * VENDOR gets a profile auto-created (same reasoning as `requireVendorId`); an
+ * ADMIN gets their own profile if they happen to run a shop, but nothing is
+ * created for them — an admin poking at the vendor console is not a shop owner,
+ * and a self-scoped page (like settlements) simply has nothing to show them.
+ * Anyone else gets null.
+ */
+export async function ownVendorIdOrNull(req: AuthedRequest): Promise<string | null> {
+  const userId = req.user?.userId;
+  if (!userId) return null;
+
+  if (isVendorRole(req.user?.role)) {
+    const existing = await vendorIdFor(userId);
+    if (existing) return existing;
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { name: true, phone: true } });
+    const created = await prisma.vendor.create({
+      data: {
+        userId,
+        shopName: user?.name || "My shop",
+        contactName: user?.name,
+        mobileNumber: user?.phone,
+      },
+      select: { id: true },
+    });
+    return created.id;
+  }
+
+  // ADMIN or anyone else: only their own profile, never a fresh one.
+  return vendorIdFor(userId);
 }
 
 /**

@@ -9,10 +9,41 @@ import { BLANK_PAGE_PAISE, DEFAULT_BW_PAGE_PAISE, DEFAULT_COLOR_PAGE_PAISE } fro
 import { requireAuth, type AuthedRequest } from "../middleware/authGuard";
 import { maybePayReferralReward } from "../referrals/service";
 import { createRazorpayOrder, verifyPaymentSignature, checkoutPage } from "../lib/razorpay";
+import { planSplit, recordTransferForPayment } from "../lib/razorpayRoute";
 import { createCheckoutSession, consumeCheckoutSession, peekCheckoutSession } from "../lib/checkoutSession";
 import { priceInPoints, pointsToPaise } from "../lib/points";
 
 export const ordersRouter = Router();
+
+/**
+ * The message a customer gets when a direct payment can't be routed. Each
+ * reason is a different fault, and only one of them is theirs to fix (paying
+ * with Points), so they are phrased apart rather than as one generic error.
+ */
+function directPayBlocked(reason?: string) {
+  switch (reason) {
+    case "VENDOR_NOT_ONBOARDED":
+      return {
+        error: "This shop isn't set up to take card or UPI payments yet. You can pay with Points instead.",
+        code: "VENDOR_NOT_ONBOARDED",
+        payWithPoints: true,
+      };
+    case "NO_VENDOR":
+      return {
+        error: "This printer isn't linked to a shop yet, so it can't take a direct payment. Pay with Points instead.",
+        code: "NO_VENDOR",
+        payWithPoints: true,
+      };
+    case "AMOUNT_TOO_SMALL":
+      return {
+        error: "This order is too small to pay by card or UPI. Please pay with Points.",
+        code: "AMOUNT_TOO_SMALL",
+        payWithPoints: true,
+      };
+    default:
+      return { error: "This order can't be paid directly right now. Please pay with Points." };
+  }
+}
 
 
 // Parse "1:BW,2:COLOR,5:COLOR" → [{page, mode}]
@@ -171,7 +202,22 @@ ordersRouter.post("/from-temp", requireAuth, async (req: AuthedRequest, res) => 
     return res.status(503).json({ error: "Online payments are not enabled on the server yet." });
   }
   const order = await prisma.order.create({ data: { ...baseData, status: "PENDING_PAYMENT" } });
-  const rz = await createRazorpayOrder(costPaise, order.orderCode, { orderId: order.id });
+
+  // Work out the Route split before charging. A direct payment must go to the
+  // shop that owns the printer — never into a platform balance — so an order
+  // that can't be routed is refused here rather than taken and held.
+  const split = await planSplit(order.id);
+  if (!split.transfer) {
+    await prisma.order.delete({ where: { id: order.id } }).catch(() => {});
+    return res.status(409).json(directPayBlocked(split.reason));
+  }
+
+  const rz = await createRazorpayOrder(
+    costPaise,
+    order.orderCode,
+    { orderId: order.id },
+    [split.transfer]
+  );
   const updated = await prisma.order.update({ where: { id: order.id }, data: { razorpayOrderId: rz.id } });
 
   res.json({ order: updated, razorpayOrderId: rz.id, keyId: config.razorpay.keyId, mode: config.razorpay.mode, amountPaise: costPaise });
@@ -296,7 +342,22 @@ ordersRouter.post("/blank", requireAuth, async (req: AuthedRequest, res) => {
     return res.status(503).json({ error: "Online payments are not enabled on the server yet." });
   }
   const order = await prisma.order.create({ data: { ...baseData, paymentMethod: "UPI", status: "PENDING_PAYMENT" } });
-  const rz = await createRazorpayOrder(costPaise, order.orderCode, { orderId: order.id });
+
+  // Same rule as a document order: a direct payment must reach the shop, so an
+  // order that can't be routed is refused rather than taken and held.
+  const split = await planSplit(order.id);
+  if (!split.transfer) {
+    await prisma.order.delete({ where: { id: order.id } }).catch(() => {});
+    await prisma.document.delete({ where: { id: doc.id } }).catch(() => {});
+    return res.status(409).json(directPayBlocked(split.reason));
+  }
+
+  const rz = await createRazorpayOrder(
+    costPaise,
+    order.orderCode,
+    { orderId: order.id },
+    [split.transfer]
+  );
   const updated = await prisma.order.update({ where: { id: order.id }, data: { razorpayOrderId: rz.id } });
 
   res.json({ order: updated, razorpayOrderId: rz.id, keyId: config.razorpay.keyId, mode: config.razorpay.mode, amountPaise: costPaise });
@@ -381,6 +442,12 @@ ordersRouter.post("/verify", async (req, res) => {
       await tx.order.update({ where: { id: order.id }, data: { status: "PAID", razorpayPaymentId: razorpay_payment_id } });
       if (order.printerId) await tx.printJob.create({ data: { orderId: order.id, printerId: order.printerId, status: "QUEUED" } });
     });
+
+    // Note which Route transfer carried the shop's share, so a later refund can
+    // reverse that exact leg. Best-effort and outside the transaction: the
+    // payment is already captured and settled, and failing to record the id
+    // must not undo a successful payment.
+    await recordTransferForPayment(order.id, razorpay_payment_id);
   }
 
   // Spend the session only once the order is actually marked paid.
@@ -445,7 +512,11 @@ ordersRouter.get("/", requireAuth, async (req: AuthedRequest, res) => {
     orderBy: { createdAt: "desc" },
     take: 50,
     include: {
-      document: { select: { fileName: true, fileType: true, pageCount: true } },
+      // keepUntil/deleted let the app tell a reorder that can skip upload from
+      // one that can't: a file the user didn't keep is gone within the hour.
+      document: {
+        select: { id: true, fileName: true, fileType: true, pageCount: true, keepUntil: true, deleted: true },
+      },
       printer: { select: { name: true, shopName: true, brand: true } },
     },
   });

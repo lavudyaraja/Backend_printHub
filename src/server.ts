@@ -24,6 +24,8 @@ import { financeRouter } from "./finance/router";
 import { systemRouter } from "./system/router";
 import { notificationsRouter } from "./routes/notifications";
 import { complaintsRouter } from "./complaints/router";
+import { ratingsRouter } from "./ratings/router";
+import { refundRequestsRouter } from "./refundRequests/router";
 import { startCleanup } from "./lib/cleanup";
 
 const app = express();
@@ -104,6 +106,10 @@ app.use("/api/points", pointsRouter);
 app.use("/api/wallet", pointsRouter);
 app.use("/api/notifications", notificationsRouter);
 app.use("/api/complaints", complaintsRouter);
+// Two-way order ratings. Staff moderation is under /api/admin/ratings.
+app.use("/api/ratings", ratingsRouter);
+// Customer refund requests: the shop decides, staff hear escalations.
+app.use("/api/refund-requests", refundRequestsRouter);
 
 startCleanup();
 

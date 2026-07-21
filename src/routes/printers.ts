@@ -87,6 +87,11 @@ printersRouter.get("/", requireAuth, async (req: AuthedRequest, res) => {
       lastSeenAt: true, createdAt: true,
       vendorId: true, locationId: true,
       location: { select: { id: true, name: true } },
+      // The shop's star rating, so the app can show it next to each machine on
+      // the pick-a-printer screen. This is the denormalized average on Vendor —
+      // aggregating live here would mean a ratings scan per printer on the
+      // busiest screen in the app.
+      vendor: { select: { id: true, shopName: true, ratingAvg: true, ratingCount: true } },
       _count: { select: { orders: true } },
     },
   });

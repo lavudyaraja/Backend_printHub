@@ -7,6 +7,8 @@ import { requireAuth, requireRole, type AuthedRequest } from "../middleware/auth
 import { readSettings, writeSettings, maskSecrets } from "../lib/settings";
 import { pointsToPaise } from "../lib/points";
 import { REFERRER_REWARD_POINTS, REFEREE_REWARD_POINTS } from "../referrals/types";
+import { adminRatingStats, listRatingsForAdmin, setRatingVisibility, summarize } from "../ratings/service";
+import { RATING_ADMIN_SELECT } from "../ratings/types";
 
 export const adminRouter = Router();
 adminRouter.use(requireAuth, requireRole("ADMIN"));
@@ -487,7 +489,7 @@ adminRouter.get("/vendors/:id", async (req, res) => {
   });
   if (!vendor) return res.status(404).json({ error: "Vendor not found" });
 
-  const [orders, revenue, byStatus, customers] = await Promise.all([
+  const [orders, revenue, byStatus, customers, ratingSummary, ratings] = await Promise.all([
     prisma.order.findMany({
       where: { vendorId },
       orderBy: { createdAt: "desc" },
@@ -505,6 +507,15 @@ adminRouter.get("/vendors/:id", async (req, res) => {
     }),
     prisma.order.groupBy({ by: ["status"], where: { vendorId }, _count: { _all: true } }),
     prisma.order.findMany({ where: { vendorId }, select: { userId: true }, distinct: ["userId"] }),
+    // Staff see hidden ratings too, so the moderation view here matches the
+    // ratings queue rather than the shop's own console.
+    summarize({ vendorId }),
+    prisma.rating.findMany({
+      where: { vendorId, direction: "USER_TO_VENDOR" },
+      orderBy: { createdAt: "desc" },
+      take: 50,
+      select: RATING_ADMIN_SELECT,
+    }),
   ]);
 
   const countFor = (s: string) => byStatus.find((r) => r.status === s)?._count._all ?? 0;
@@ -543,6 +554,8 @@ adminRouter.get("/vendors/:id", async (req, res) => {
     },
     orders,
     activity,
+    ratingSummary,
+    ratings,
   });
 });
 
@@ -574,7 +587,7 @@ adminRouter.get("/users/:id", async (req, res) => {
   });
   if (!user) return res.status(404).json({ error: "User not found" });
 
-  const [orders, txns, refunds, complaints, tickets, spend] = await Promise.all([
+  const [orders, txns, refunds, complaints, tickets, spend, ratingSummary, ratingsReceived, ratingsWritten] = await Promise.all([
     prisma.order.findMany({
       where: { userId },
       orderBy: { createdAt: "desc" },
@@ -623,6 +636,21 @@ adminRouter.get("/users/:id", async (req, res) => {
     prisma.order.aggregate({
       _sum: { costPaise: true, pagesToPrint: true },
       where: { userId, status: "COMPLETED" },
+    }),
+    // How shops rate this customer, and what they wrote — both sides, because a
+    // one-star review a user left is often the context for the one they got.
+    summarize({ userId }),
+    prisma.rating.findMany({
+      where: { userId, direction: "VENDOR_TO_USER" },
+      orderBy: { createdAt: "desc" },
+      take: 50,
+      select: RATING_ADMIN_SELECT,
+    }),
+    prisma.rating.findMany({
+      where: { authorId: userId, direction: "USER_TO_VENDOR" },
+      orderBy: { createdAt: "desc" },
+      take: 50,
+      select: RATING_ADMIN_SELECT,
     }),
   ]);
 
@@ -693,6 +721,9 @@ adminRouter.get("/users/:id", async (req, res) => {
     tickets,
     savedPrinters,
     activity,
+    ratingSummary,
+    ratingsReceived,
+    ratingsWritten,
   });
 });
 
@@ -842,6 +873,48 @@ adminRouter.patch("/support/:id", async (req, res) => {
     },
   });
   res.json({ ticket });
+});
+
+// ── Rating moderation ────────────────────────────────────────────────────────
+// Both directions in one queue. Staff can hide a rating but not edit or delete
+// it: the point of moderation here is to stop abuse being displayed, not to
+// rewrite what someone said. See ratings/service.ts for why hiding still counts
+// as "already rated".
+adminRouter.get("/ratings/stats", async (_req, res) => {
+  res.json(await adminRatingStats());
+});
+
+adminRouter.get("/ratings", async (req, res) => {
+  const q = req.query as Record<string, string>;
+  const result = await listRatingsForAdmin({
+    direction: q.direction === "USER_TO_VENDOR" || q.direction === "VENDOR_TO_USER" ? q.direction : undefined,
+    status: q.status === "VISIBLE" || q.status === "HIDDEN" ? q.status : undefined,
+    vendorId: q.vendorId || undefined,
+    userId: q.userId || undefined,
+    maxStars: q.maxStars ? Math.min(Math.max(parseInt(q.maxStars) || 0, 1), 5) : undefined,
+    search: q.search || undefined,
+    limit: parseInt(q.limit) || 50,
+    skip: parseInt(q.offset) || 0,
+  });
+  res.json(result);
+});
+
+adminRouter.patch("/ratings/:id", async (req: AuthedRequest, res) => {
+  const parsed = z
+    .object({
+      status: z.enum(["VISIBLE", "HIDDEN"]),
+      reason: z.string().trim().max(500).optional(),
+    })
+    .safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid update" });
+
+  const rating = await setRatingVisibility(req.params.id, parsed.data.status === "HIDDEN", {
+    adminId: req.user!.userId,
+    reason: parsed.data.reason,
+  });
+  if (!rating) return res.status(404).json({ error: "Rating not found" });
+
+  res.json({ rating });
 });
 
 // ── Platform settings ──────────────────────────────────────────────────────────

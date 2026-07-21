@@ -108,10 +108,35 @@ enum RefundReason {
 }
 
 /// How a refund came about. Automatic refunds fire when an order lands in
-/// FAILED; manual ones are issued by staff from the console.
+/// FAILED; manual ones are issued by staff from the console; VENDOR_APPROVED
+/// ones are a shop granting a customer's request without staff involvement.
 enum RefundOrigin {
   AUTOMATIC
   MANUAL
+  VENDOR_APPROVED
+}
+
+/// Where a customer's refund request has got to.
+///
+/// The shop decides first, because they are the ones who saw the machine and
+/// the paper. Staff only get involved when the customer disputes a rejection —
+/// that is what ESCALATED means, and it is the only path from a "no" to a
+/// second opinion.
+enum RefundRequestStatus {
+  /// Waiting on the shop.
+  PENDING
+  /// The shop granted it; a Refund row exists and points are back.
+  APPROVED
+  /// The shop turned it down. The customer can escalate from here.
+  REJECTED
+  /// The customer disputed a rejection. Now in the platform's queue.
+  ESCALATED
+  /// Staff overruled the rejection and refunded.
+  ESCALATION_APPROVED
+  /// Staff agreed with the shop. This is the end of the line.
+  ESCALATION_REJECTED
+  /// Withdrawn by the customer, e.g. the reprint worked.
+  CANCELLED
 }
 
 /// Where a payout is in its life. Nothing here talks to a bank — a payout is
@@ -132,6 +157,51 @@ enum PaymentMethod {
   CREDIT_CARD
   DEBIT_CARD
   NET_BANKING
+}
+
+/// Which way a rating points. Both sides of a completed order may rate the
+/// other, and a single Rating table holds both — the pair is far more useful
+/// read together (a one-star review next to the vendor's own account of the
+/// same order) than split across two tables that only ever get joined.
+enum RatingDirection {
+  /// The student rating the shop that printed for them.
+  USER_TO_VENDOR
+  /// The shop rating the student who placed the order.
+  VENDOR_TO_USER
+}
+
+/// Quick-pick reasons attached to a rating, so feedback is usable without
+/// anyone having to type. Kept in one enum rather than two because Prisma
+/// cannot scope an enum per direction; which tags may be used with which
+/// direction is enforced in ratings/types.ts, where it can carry a message.
+enum RatingTag {
+  // ── student → shop ──
+  PRINT_QUALITY
+  FAST_SERVICE
+  CLEAN_SHOP
+  HELPFUL_STAFF
+  FAIR_PRICING
+  SLOW_SERVICE
+  RUDE_STAFF
+  MACHINE_ISSUES
+  OVERCHARGED
+
+  // ── shop → student ──
+  POLITE
+  ON_TIME_PICKUP
+  CLEAR_INSTRUCTIONS
+  NO_SHOW
+  RUDE_BEHAVIOUR
+  MISUSED_MACHINE
+  WASTED_PAPER
+}
+
+/// Moderation state. A hidden rating still counts as "already rated" for the
+/// author — hiding is not an invitation to post it again — but drops out of
+/// public lists and out of the averages.
+enum RatingStatus {
+  VISIBLE
+  HIDDEN
 }
 
 // ------------------------------------------------------------------
@@ -186,6 +256,15 @@ model User {
   /// row, and a self-relation here would need a back-reference that has no use.
   bannedById    String?
 
+  /// Average of the VISIBLE stars shops have given this account, and how many
+  /// there are. Denormalized: the vendor console shows a customer's standing
+  /// while they are placing an order, and averaging their whole rating history
+  /// on that path would put a scan of every past order in front of a checkout.
+  /// Recomputed inside the same transaction as every rating write — see
+  /// ratings/service.ts.
+  ratingAvg     Float    @default(0)
+  ratingCount   Int      @default(0)
+
   documents     Document[]
   orders        Order[]
   notifications Notification[]
@@ -193,6 +272,12 @@ model User {
   complaints    Complaint[]
   refunds       Refund[]
   bankAccount   BankAccount?
+  /// Ratings this account wrote — as a student about a shop, or, for a vendor
+  /// login, about a customer.
+  ratingsWritten  Rating[] @relation("RatingAuthor")
+  /// Ratings shops have written about this account.
+  ratingsReceived Rating[] @relation("RatingSubjectUser")
+  refundRequests  RefundRequest[]
   /// Set only for vendor-console accounts.
   vendor        Vendor?
 
@@ -311,6 +396,11 @@ model Order {
   paymentMethod  PaymentMethod?
   razorpayOrderId String?
   razorpayPaymentId String?
+  /// The Route transfer (`trf_…`) that moved this order's share to the shop.
+  /// Set only for a direct payment that was split at capture; null for Points
+  /// orders (nothing was routed) and for orders taken before Route existed.
+  /// Kept so a refund can reverse the exact transfer rather than guessing.
+  razorpayTransferId String?
 
   status     OrderStatus @default(PENDING_PAYMENT)
   printToken String      @unique
@@ -327,6 +417,8 @@ model Order {
   printJob PrintJob?
   complaints Complaint[]
   refund     Refund?
+  ratings    Rating[]
+  refundRequest RefundRequest?
 
   @@index([userId])
   @@index([status])
@@ -362,11 +454,55 @@ model Vendor {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
+  /// The shop's Razorpay Route linked account (`acc_…`).
+  ///
+  /// This is what makes a customer's payment reach *this* shop and no other.
+  /// When it is set and `routeActive`, every direct (UPI/card) order at one of
+  /// this shop's printers is split by Razorpay at capture time: the shop's share
+  /// settles straight to this account, and only the platform commission stays
+  /// with the platform. The money never rests in a platform balance to be paid
+  /// out by hand — see lib/razorpayRoute.ts.
+  ///
+  /// Null means the shop hasn't onboarded yet. Its printers can still take Points
+  /// orders, but a direct payment has nowhere to be routed, so those are blocked
+  /// until onboarding completes rather than quietly landing in the platform
+  /// account.
+  razorpayAccountId String?
+  /// True once Razorpay has activated the linked account and it can actually
+  /// receive transfers. An account can exist (`razorpayAccountId` set) while
+  /// still pending KYC, during which it must not be sent money.
+  routeActive       Boolean  @default(false)
+  /// Last thing Razorpay told us about the account's onboarding — shown to the
+  /// shop so a stuck KYC isn't a silent dead end.
+  routeStatusNote   String?
+
+  /// Average of the VISIBLE stars customers have given this shop, and how many
+  /// there are. Denormalized because the app shows a star next to every printer
+  /// on the pick-a-machine screen: computing it live would mean aggregating
+  /// ratings for every vendor in range on each load of the busiest screen.
+  ratingAvg    Float    @default(0)
+  ratingCount  Int      @default(0)
+
+  /// When the shop is open, as `{ mon: { open: "09:00", close: "20:00",
+  /// closed: false }, ... }` keyed by the seven short day names.
+  ///
+  /// Json rather than a table of seven rows per vendor: nothing queries across
+  /// it — it is read whole to render a week and written whole when the week is
+  /// saved — and a `Location`-style relation would turn one read into a join
+  /// for data that is never filtered on. The shape is validated in
+  /// routes/vendors.ts before it is written, so a malformed week cannot land.
+  ///
+  /// Null means the shop has never set hours, which is displayed as "not set"
+  /// rather than as "closed all week".
+  operatingHours Json?
+
   user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
   locations Location[]
   printers  Printer[]
   orders    Order[]
   payouts   Payout[]
+  ratings   Rating[]
+  refundRequests RefundRequest[]
 }
 
 /// A physical place a vendor operates from — one vendor can run several.
@@ -513,6 +649,69 @@ model Complaint {
   @@index([printerId])
 }
 
+/// One side's rating of the other, for one completed order.
+///
+/// Every rating hangs off an order, and only the two parties to that order can
+/// write one. That is the whole anti-abuse story: a shop cannot be review-
+/// bombed by accounts that never printed there, and a student cannot be marked
+/// a no-show by a shop they have never used. The `@@unique([orderId, direction])`
+/// is what makes it one rating per side per order — enforced in the database
+/// rather than by checking first, because two taps on a slow connection is the
+/// ordinary case, not the exotic one.
+///
+/// Both subjects are stored on every row, whichever way it points: a shop's
+/// rating of a student still records which vendor said it, so the console can
+/// show a customer "rated by 3 of the 4 shops you've used" without walking back
+/// through orders.
+model Rating {
+  id        String          @id @default(cuid())
+  orderId   String
+  direction RatingDirection
+
+  /// 1–5. Range is enforced in ratings/types.ts — Prisma has no check constraint.
+  stars     Int
+  /// Free text, optional. A star with no words is still a rating.
+  comment   String?
+  /// Quick-pick reasons. Validated against the direction before it is written.
+  tags      RatingTag[]
+
+  /// Who wrote it. For USER_TO_VENDOR this is the student; for VENDOR_TO_USER
+  /// it is the vendor's own login, so a shop that changes hands still shows who
+  /// actually left the rating.
+  authorId  String
+  /// The student side of the order — the subject when VENDOR_TO_USER, and the
+  /// author when USER_TO_VENDOR.
+  userId    String
+  /// The shop side of the order. Not nullable the way Order.vendorId is: a
+  /// rating with no shop attached has nobody to be about.
+  vendorId  String
+
+  status       RatingStatus @default(VISIBLE)
+  /// Why staff hid it, shown in the moderation log. Null while VISIBLE.
+  hiddenReason String?
+  /// The admin who hid it. Not a relation, for the same reason bannedById isn't.
+  hiddenById   String?
+  hiddenAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order  Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  author User   @relation("RatingAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  user   User   @relation("RatingSubjectUser", fields: [userId], references: [id], onDelete: Cascade)
+  vendor Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  /// One rating per side per order.
+  @@unique([orderId, direction])
+  /// The shop's own ratings list, newest first.
+  @@index([vendorId, direction, status, createdAt])
+  /// A customer's received ratings, and "have I rated this order yet?".
+  @@index([userId, direction, status, createdAt])
+  @@index([authorId, createdAt])
+  /// The admin moderation queue, which filters on status alone.
+  @@index([status, createdAt])
+}
+
 /// A refund issued against an order.
 ///
 /// Refunds are always paid as Prinsta Points, whatever the order was paid with:
@@ -545,6 +744,68 @@ model Refund {
 
   @@index([userId])
   @@index([userId, createdAt])
+}
+
+/// A customer asking for their money back.
+///
+/// This is the *ask*; `Refund` is the money actually moving. They are separate
+/// tables because most requests never become a refund, and a rejected request
+/// still has to be answerable months later — "I asked and they said no" is a
+/// thing a student will come back about, and it needs a record.
+///
+/// One request per order (`orderId` is unique). A rejection is not an invitation
+/// to keep asking the same shop until they give in; the way forward from a "no"
+/// is ESCALATED, which is the same row moving into the platform's queue.
+model RefundRequest {
+  id          String              @id @default(cuid())
+  /// Human-quotable reference, e.g. RFR-8F3A2K.
+  code        String              @unique
+  orderId     String              @unique
+  userId      String
+  /// The shop that has to answer it. Copied from the order rather than joined
+  /// through it, for the same reason Order.vendorId is copied off the printer —
+  /// a machine can be sold, and the request still belongs to whoever took the
+  /// money.
+  vendorId    String?
+
+  reason      RefundReason
+  /// The customer's account of what went wrong, in their own words.
+  description String
+  status      RefundRequestStatus @default(PENDING)
+
+  /// The vendor login that approved or rejected. Not a relation — it points at
+  /// a User row and a back-reference here would have no use.
+  decidedById String?
+  decidedAt   DateTime?
+  /// The shop's reason, shown to the customer. Required on a rejection: a "no"
+  /// with no explanation is what makes people escalate.
+  decisionNote String?
+
+  /// Set when the customer disputes a rejection.
+  escalatedAt DateTime?
+  /// Why they think the shop got it wrong.
+  escalationNote String?
+  /// Staff's answer to the escalation.
+  staffNote   String?
+  resolvedById String?
+  resolvedAt  DateTime?
+
+  /// The refund this became, once approved. Nullable because most requests
+  /// never get here, and unique because one refund can't settle two requests.
+  refundId    String?             @unique
+
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  order  Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vendor Vendor? @relation(fields: [vendorId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  /// The shop's pending queue — the hottest read on this table.
+  @@index([vendorId, status, createdAt])
+  /// The platform's escalation queue.
+  @@index([status, createdAt])
 }
 
 /// Money paid out to a vendor for a period's takings.

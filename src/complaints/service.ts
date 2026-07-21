@@ -56,6 +56,38 @@ async function resolveLinks(userId: string, input: CreateComplaintInput) {
   return { orderId, printerId };
 }
 
+/**
+ * Notify the shop that owns the machine a complaint is about.
+ *
+ * The complaint carries a printerId, and a printer carries its vendor, whose
+ * console login is the account to reach. When there's no printer (a payment or
+ * points complaint with nothing physical behind it), there's no shop to tell —
+ * that one is the platform's, and it stays in the admin queue.
+ */
+async function notifyComplaintVendor(
+  printerId: string | null,
+  code: string,
+  subject: string,
+  orderId: string | null
+): Promise<void> {
+  if (!printerId) return;
+  const printer = await prisma.printer.findUnique({
+    where: { id: printerId },
+    select: { name: true, vendor: { select: { userId: true } } },
+  });
+  const vendorUserId = printer?.vendor?.userId;
+  if (!vendorUserId) return;
+
+  await prisma.notification.create({
+    data: {
+      userId: vendorUserId,
+      title: "New complaint about your printer",
+      body: `${code} — ${subject}${printer?.name ? ` on ${printer.name}` : ""}. Open your console to see the details.`,
+      orderId,
+    },
+  });
+}
+
 export async function createComplaint(
   userId: string,
   input: CreateComplaintInput,
@@ -97,6 +129,13 @@ export async function createComplaint(
       },
     })
     .catch(() => {}); // a failed notification must not undo a filed complaint
+
+  // Tell the shop that owns the machine, so the report reaches whoever can
+  // actually walk over and fix it — the user → vendor half of the chain. The
+  // admin half needs no notification: every complaint already surfaces in the
+  // operations console's Disputes queue. Best-effort, and never blocks the
+  // filing.
+  await notifyComplaintVendor(printerId, complaint.code, subject, orderId).catch(() => {});
 
   return complaint;
 }

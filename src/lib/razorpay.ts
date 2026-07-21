@@ -16,20 +16,67 @@ function client(): Razorpay {
   return _client;
 }
 
+/**
+ * The raw Razorpay client, for the Route helpers in lib/razorpayRoute.ts. Kept
+ * behind a function so it is still created lazily and still throws the same
+ * "not configured" error rather than handing back a half-built client.
+ */
+export function razorpayClient(): Razorpay {
+  return client();
+}
+
 export interface RzOrder {
   id: string;
   amount: number;
   currency: string;
 }
 
-/** Create a Razorpay order for the given amount (paise). */
-export async function createRazorpayOrder(amountPaise: number, receipt: string, notes?: Record<string, string>): Promise<RzOrder> {
+/**
+ * One leg of a Route split: send `amount` paise of this order to a linked
+ * account (`acc_…`). Only the shop's share is ever transferred — whatever is
+ * left stays in the platform account as commission, which is why there is no
+ * "platform" leg here.
+ */
+export interface RzTransfer {
+  account: string;
+  amount: number;
+  notes?: Record<string, string>;
+}
+
+/**
+ * Create a Razorpay order, optionally with Route transfers attached.
+ *
+ * When `transfers` is given, Razorpay performs the split *at capture* — the
+ * moment the customer's payment succeeds, the shop's share settles to its
+ * linked account and never touches a platform balance. The transfers ride on
+ * the order rather than being made afterwards precisely so there is no window
+ * in which the whole amount sits with the platform.
+ */
+export async function createRazorpayOrder(
+  amountPaise: number,
+  receipt: string,
+  notes?: Record<string, string>,
+  transfers?: RzTransfer[]
+): Promise<RzOrder> {
   const order = await client().orders.create({
     amount: amountPaise,
     currency: "INR",
     receipt,
     notes,
-  });
+    ...(transfers && transfers.length
+      ? {
+          transfers: transfers.map((t) => ({
+            account: t.account,
+            amount: t.amount,
+            currency: "INR",
+            notes: t.notes,
+            // Release to the shop as soon as it is captured — there is no
+            // inspection step that would justify holding a print job's payment.
+            on_hold: false,
+          })),
+        }
+      : {}),
+  } as any);
   return { id: order.id, amount: Number(order.amount), currency: order.currency };
 }
 

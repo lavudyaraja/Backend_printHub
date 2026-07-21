@@ -76,6 +76,61 @@ documentsRouter.post("/upload", requireAuth, upload.single("file"), async (req: 
 // ── Mint an access token for a document you own ─────────────────────────────
 // The raw-file endpoint can't require an Authorization header (see serveFile),
 // so ownership is proved here, once, in exchange for a short-lived token.
+// ── Documents still on hand ─────────────────────────────────────────────────
+// Only files the user explicitly asked to keep survive past their print (see
+// the sweeper in lib/cleanup). Those are the only ones that can be reprinted
+// without uploading again, so they are the only ones worth listing.
+//
+// Registered before "/:id/..." so the literal path is never read as an id.
+documentsRouter.get("/saved", requireAuth, async (req: AuthedRequest, res) => {
+  const docs = await prisma.document.findMany({
+    where: {
+      userId: req.user!.userId,
+      deleted: false,
+      fileData: { not: null },
+      keepUntil: { gt: new Date() },
+    },
+    orderBy: { createdAt: "desc" },
+    select: {
+      id: true,
+      fileName: true,
+      fileType: true,
+      pageCount: true,
+      sizeBytes: true,
+      keepUntil: true,
+      createdAt: true,
+      // The previous run's settings, so a reprint can skip straight to payment
+      // with colour/sides/copies already as the user had them.
+      order: {
+        select: {
+          orderCode: true,
+          colorMode: true,
+          sideMode: true,
+          copies: true,
+          pageRange: true,
+          pageColorModes: true,
+          pagesToPrint: true,
+          costPaise: true,
+        },
+      },
+    },
+  });
+
+  res.json({
+    keepDays: KEEP_DAYS,
+    documents: docs.map((d) => ({
+      id: d.id,
+      fileName: d.fileName,
+      fileType: d.fileType,
+      pageCount: d.pageCount,
+      sizeBytes: d.sizeBytes,
+      keepUntil: d.keepUntil,
+      createdAt: d.createdAt,
+      lastOrder: d.order,
+    })),
+  });
+});
+
 documentsRouter.get("/:id/access", requireAuth, async (req: AuthedRequest, res) => {
   const doc = await prisma.document.findUnique({
     where: { id: req.params.id },
