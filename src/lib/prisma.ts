@@ -8,8 +8,9 @@ import { PrismaClient, Prisma } from "@prisma/client";
  *   P1002 - server reached but timed out
  *   P1008 - operation timed out
  *   P1017 - server closed the connection
+ *   P2024 - timed out fetching a connection from the pool
  */
-const RETRYABLE = new Set(["P1001", "P1002", "P1008", "P1017"]);
+const RETRYABLE = new Set(["P1001", "P1002", "P1008", "P1017", "P2024"]);
 
 const MAX_RETRIES = 6;
 const BASE_DELAY_MS = 400;
@@ -19,6 +20,9 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 function isRetryable(err: unknown): boolean {
   if (err instanceof Prisma.PrismaClientKnownRequestError) {
     return RETRYABLE.has(err.code);
+  }
+  if (err instanceof Error && err.message.includes("connection pool")) {
+    return true;
   }
   // Cold-start init failures surface as this class before a code is assigned.
   return err instanceof Prisma.PrismaClientInitializationError;
