@@ -45,10 +45,6 @@ prisma.$use(async (params, next) => {
       if (!isRetryable(err) || attempt === MAX_RETRIES) throw err;
       const delay =
         BASE_DELAY_MS * 2 ** attempt + Math.floor(Math.random() * 200);
-      console.warn(
-        `[prisma] DB unreachable on ${params.model ?? "?"}.${params.action} ` +
-          `(attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${delay}ms…`
-      );
       await sleep(delay);
     }
   }
@@ -66,11 +62,9 @@ export async function connectWithRetry(): Promise<void> {
       return;
     } catch (err) {
       if (!isRetryable(err) || attempt === MAX_RETRIES) {
-        console.error("[prisma] could not reach the database on startup:", err);
         return; // don't crash the server — the query-level retry still guards requests
       }
       const delay = BASE_DELAY_MS * 2 ** attempt;
-      console.warn(`[prisma] warming DB (attempt ${attempt + 1})… retry in ${delay}ms`);
       await sleep(delay);
     }
   }
