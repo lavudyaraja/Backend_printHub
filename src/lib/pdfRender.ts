@@ -30,7 +30,11 @@ export async function pdfToImages(pdf: Buffer): Promise<Jimp[]> {
     const doc = await library.loadDocument(pdf);
     try {
       const images: Jimp[] = [];
+      // A hard cap so a huge PDF can't exhaust memory on a small instance.
+      const MAX_PAGES = 60;
+      let count = 0;
       for (const page of doc.pages()) {
+        if (count++ >= MAX_PAGES) break;
         try {
           const rendered = await page.render({ scale: RENDER_SCALE, render: "bitmap" });
           const data = Buffer.from(rendered.data);

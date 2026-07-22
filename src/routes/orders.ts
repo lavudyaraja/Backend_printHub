@@ -481,6 +481,42 @@ ordersRouter.post("/:id/status", requireAuth, async (req: AuthedRequest, res) =>
   res.json({ ok: true, status: updated.status });
 });
 
+// ── Link an order to the printer it's actually being printed on ──────────────
+// Orders started without picking a printer from the list have no printerId, so
+// they never reach the shop that owns the machine. When the app connects to a
+// printer's Wi-Fi Direct network to print, it tells us the SSID here; we resolve
+// that to the registered printer and stamp the order with its printer + vendor,
+// so the order (and any issue raised on it) reaches the right shop.
+ordersRouter.post("/:id/attach-printer", requireAuth, async (req: AuthedRequest, res) => {
+  const ssid = typeof req.body?.ssid === "string" ? req.body.ssid.trim() : "";
+  if (!ssid) return res.status(400).json({ error: "Missing printer SSID." });
+
+  const order = await prisma.order.findFirst({
+    where: { id: req.params.id, userId: req.user!.userId },
+    select: { id: true, printerId: true, vendorId: true },
+  });
+  if (!order) return res.status(404).json({ error: "Order not found" });
+
+  // Already linked to a shop — nothing to do.
+  if (order.printerId && order.vendorId) return res.json({ ok: true, alreadyLinked: true });
+
+  const printer = await prisma.printer.findFirst({
+    where: { wifiSsid: { equals: ssid, mode: "insensitive" } },
+    select: { id: true, vendorId: true, locationId: true },
+  });
+  if (!printer) return res.json({ ok: false, reason: "NO_MATCH" });
+
+  await prisma.order.update({
+    where: { id: order.id },
+    data: { printerId: printer.id, vendorId: printer.vendorId, locationId: printer.locationId },
+  });
+  await prisma.printJob
+    .updateMany({ where: { orderId: order.id }, data: { printerId: printer.id } })
+    .catch(() => {});
+
+  res.json({ ok: true, linked: true });
+});
+
 // ── List the user's orders ──────────────────────────────────────────────────
 ordersRouter.get("/", requireAuth, async (req: AuthedRequest, res) => {
   const orders = await prisma.order.findMany({
