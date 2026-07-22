@@ -6,8 +6,7 @@ import multer from "multer";
 import { PDFDocument } from "pdf-lib";
 import { prisma } from "../lib/prisma";
 import { config } from "../lib/config";
-import { imageToUrf, pdfToUrf } from "../lib/urf";
-import { imageToPwgRaster, pdfToPwgRaster } from "../lib/pwgRaster";
+import { printFormat } from "../lib/printFormats";
 import { requireAuth, type AuthedRequest } from "../middleware/authGuard";
 import { verifyToken } from "../lib/auth";
 import { signFileToken, verifyFileToken } from "../lib/fileToken";
@@ -229,21 +228,6 @@ async function subsetPdf(buf: Uint8Array, range: string): Promise<Uint8Array | n
 }
 
 /**
- * Wrap a raw image (PNG/JPEG) into a single-page PDF sized to the image, so it
- * can be printed over IPP (which expects application/pdf). Returns null for
- * formats pdf-lib can't embed (webp/gif/heic) — the caller then serves the
- * original bytes.
- */
-async function imageToPdf(buf: Uint8Array, mime: string): Promise<Uint8Array | null> {
-  const pdf = await PDFDocument.create();
-  const isPng = mime.includes("png") || (buf[0] === 0x89 && buf[1] === 0x50);
-  const img = isPng ? await pdf.embedPng(buf) : await pdf.embedJpg(buf);
-  const page = pdf.addPage([img.width, img.height]);
-  page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
-  return pdf.save();
-}
-
-/**
  * Ownership check for the raw-file endpoint. A URL fetched by <Image>, by
  * FileSystem.downloadAsync or by a document viewer carries no Authorization
  * header, so a short-lived `?t=` token is the primary credential; a bearer
@@ -293,57 +277,30 @@ async function serveFile(req: any, res: any) {
     }
   }
 
-  // ?format=pwg → PWG-Raster, the format IPP Everywhere / Mopria printers must
-  // accept. Images rasterise directly; PDFs are rendered page-by-page first, so
-  // a cheap laser with no PDF interpreter (Pantum et al.) can still print them.
-  if (req.query.format === "pwg" && (doc.fileType === "image" || doc.fileType === "pdf")) {
+  // ?format=… → hand the document to the print-format registry, which knows how
+  // to turn it into whatever wire encoding the printer wants (PWG-Raster, URF,
+  // PDF, JPEG, PostScript, PCL, plain text). Every format lives in one place
+  // (lib/printFormats) so adding one never touches this route.
+  //
+  // A format that can't be produced from this document (e.g. JPEG of a 10-page
+  // PDF) throws; we answer 415 so the app's cascade moves to the next format
+  // rather than treating it as a hard error. `format=pdf` on an actual PDF is
+  // the common pass-through and stays cheap.
+  const fmt = printFormat(req.query.format);
+  if (fmt) {
     try {
-      const pwg =
-        doc.fileType === "pdf"
-          ? await pdfToPwgRaster(Buffer.from(body))
-          : await imageToPwgRaster(Buffer.from(body));
-      res.setHeader("Content-Type", "image/pwg-raster");
-      res.setHeader("Content-Disposition", `inline; filename="print.pwg"`);
+      const out = await fmt.produce({
+        body: Buffer.from(body),
+        fileType: doc.fileType,
+        mimeType: doc.mimeType || "",
+      });
+      res.setHeader("Content-Type", fmt.mime);
+      res.setHeader("Content-Disposition", `inline; filename="print.${fmt.ext}"`);
       res.setHeader("Cache-Control", "private, no-store");
-      return res.send(pwg);
+      return res.send(out);
     } catch (e) {
-      console.error("[documents] →pwg failed:", e);
-      return res.status(500).json({ error: "Could not rasterise the document for printing." });
-    }
-  }
-
-  // ?format=urf → Apple Raster, so the app can print directly over IPP (no OS
-  // dialog). Same two sources as PWG.
-  if (req.query.format === "urf" && (doc.fileType === "image" || doc.fileType === "pdf")) {
-    try {
-      const urf =
-        doc.fileType === "pdf"
-          ? await pdfToUrf(Buffer.from(body))
-          : await imageToUrf(Buffer.from(body));
-      res.setHeader("Content-Type", "image/urf");
-      res.setHeader("Content-Disposition", `inline; filename="print.urf"`);
-      res.setHeader("Cache-Control", "private, no-store");
-      return res.send(urf);
-    } catch (e) {
-      console.error("[documents] →urf failed:", e);
-      return res.status(500).json({ error: "Could not rasterise the document for printing." });
-    }
-  }
-
-  // ?format=pdf → the caller (direct-print) needs a real PDF. Printers speak IPP
-  // with document-format application/pdf, so an image must be wrapped in a PDF
-  // page or the printer rejects the job. PDFs already qualify and pass through.
-  if (req.query.format === "pdf" && doc.fileType === "image") {
-    try {
-      const wrapped = await imageToPdf(body, doc.mimeType || "");
-      if (wrapped) {
-        res.setHeader("Content-Type", "application/pdf");
-        res.setHeader("Content-Disposition", `inline; filename="print.pdf"`);
-        res.setHeader("Cache-Control", "private, no-store");
-        return res.send(Buffer.from(wrapped));
-      }
-    } catch (e) {
-      console.error("[documents] image→pdf failed, serving original:", e);
+      console.error(`[documents] →${fmt.key} failed:`, e);
+      return res.status(415).json({ error: `Could not produce ${fmt.key} for this document.` });
     }
   }
 
