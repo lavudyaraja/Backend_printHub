@@ -54,9 +54,13 @@ function encodeUrfPage(img: Jimp, w: number, h: number, dpi: number): Buffer {
 
   const chunks: Buffer[] = [pageHeader];
   const rowStride = w * 4;
+  // Preallocated row buffer (see pwgRaster for why): worst case is 1 line-repeat
+  // byte plus 4 bytes (RGB run marker) per pixel.
+  const rowBuf = Buffer.allocUnsafe(1 + 4 * w);
   for (let y = 0; y < h; y++) {
     const base = y * rowStride;
-    const out: number[] = [0]; // line-repeat = 0 (row appears once)
+    let p = 0;
+    rowBuf[p++] = 0; // line-repeat = 0 (row appears once)
     let x = 0;
     while (x < w) {
       const i = base + x * 4;
@@ -67,10 +71,13 @@ function encodeUrfPage(img: Jimp, w: number, h: number, dpi: number): Buffer {
         if (px[j] === r && px[j + 1] === g && px[j + 2] === b) run++;
         else break;
       }
-      out.push(run - 1, r, g, b);
+      rowBuf[p++] = run - 1;
+      rowBuf[p++] = r;
+      rowBuf[p++] = g;
+      rowBuf[p++] = b;
       x += run;
     }
-    chunks.push(Buffer.from(out));
+    chunks.push(Buffer.from(rowBuf.subarray(0, p))); // copy: rowBuf is reused
   }
   return Buffer.concat(chunks);
 }

@@ -57,18 +57,25 @@ function encodePwgPage(canvas: Jimp, totalPages: number, dpi: number): Buffer {
   const px = canvas.bitmap.data; // RGBA
   const chunks: Buffer[] = [buildPageHeader(w, h, dpi, totalPages)];
   const rowStride = w * 4;
+  // Encode straight into a preallocated row buffer instead of pushing onto a JS
+  // number[] and re-copying it: at 600 dpi a page is ~35M pixels, and the array
+  // path dominated render time. Worst case (no runs) is 1 line-repeat byte plus
+  // 2 bytes per pixel.
+  const rowBuf = Buffer.allocUnsafe(1 + 2 * w);
   for (let y = 0; y < h; y++) {
     const base = y * rowStride;
-    const out: number[] = [0]; // line-repeat = 0 → this line appears once
+    let p = 0;
+    rowBuf[p++] = 0; // line-repeat = 0 → this line appears once
     let x = 0;
     while (x < w) {
       const gray = px[base + x * 4]; // grayscale() makes R=G=B
       let run = 1;
       while (x + run < w && run < 128 && px[base + (x + run) * 4] === gray) run++;
-      out.push(run - 1, gray);
+      rowBuf[p++] = run - 1;
+      rowBuf[p++] = gray;
       x += run;
     }
-    chunks.push(Buffer.from(out));
+    chunks.push(Buffer.from(rowBuf.subarray(0, p))); // copy: rowBuf is reused
   }
   return Buffer.concat(chunks);
 }
