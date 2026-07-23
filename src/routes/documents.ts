@@ -6,7 +6,7 @@ import multer from "multer";
 import { PDFDocument } from "pdf-lib";
 import { prisma } from "../lib/prisma";
 import { config } from "../lib/config";
-import { printFormat } from "../lib/printFormats";
+import { printFormat, produceGuarded } from "../lib/printFormats";
 import { requireAuth, type AuthedRequest } from "../middleware/authGuard";
 import { verifyToken } from "../lib/auth";
 import { signFileToken, verifyFileToken } from "../lib/fileToken";
@@ -290,7 +290,7 @@ async function serveFile(req: any, res: any) {
   if (fmt) {
     try {
       const dpi = typeof req.query.dpi === "string" ? parseInt(req.query.dpi, 10) : undefined;
-      const out = await fmt.produce({
+      const out = await produceGuarded(fmt, {
         body: Buffer.from(body),
         fileType: doc.fileType,
         mimeType: doc.mimeType || "",

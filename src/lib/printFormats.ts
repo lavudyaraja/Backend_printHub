@@ -241,3 +241,31 @@ export function printFormat(key: unknown): PrintFormatSpec | undefined {
     ? PRINT_FORMATS[key as PrintFormatKey]
     : undefined;
 }
+
+// ── Rasterisation memory guard ────────────────────────────────────────────────
+// Every raster job materialises a full A4 bitmap in RAM (≈35 MB at 300 dpi,
+// ≈140 MB at 600 dpi) plus Jimp's working copies. The free deploy box has only
+// 512 MB, so two or three of these running at once — which is exactly what a
+// client that pre-fetches several formats produces — overruns it and the whole
+// process is OOM-killed mid-request. That crash is what surfaced to users as
+// both "server couldn't produce the file" (the print never got its raster) and
+// the database errors (Prisma's connection died with the process).
+//
+// A one-at-a-time gate keeps peak memory to a single bitmap regardless of how
+// many requests arrive together: they queue instead of piling their allocations
+// on top of each other. Producing is CPU/alloc-bound, not IO-bound, so
+// serialising costs little latency while removing the crash entirely.
+let rasterChain: Promise<unknown> = Promise.resolve();
+
+/**
+ * Run a format's `produce()` under the global raster gate. Non-raster formats
+ * (pdf pass-through, text) are cheap, but routing everything through one queue
+ * keeps the rule in a single place and still bounds a burst of PDF wraps.
+ */
+export function produceGuarded(spec: PrintFormatSpec, input: FormatInput): Promise<Buffer> {
+  const run = rasterChain.then(() => spec.produce(input));
+  // Keep the chain alive whether this job resolves or rejects, so one failure
+  // doesn't wedge the queue for every job behind it.
+  rasterChain = run.catch(() => undefined);
+  return run;
+}

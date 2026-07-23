@@ -8,7 +8,7 @@
 // runs; we only emit repeat-runs (count 0–127 → pixel repeated count+1 times),
 // which is always valid and compresses the large white margins well.
 import Jimp from "jimp";
-import { pdfToImages } from "./pdfRender";
+import { forEachPdfPage } from "./pdfRender";
 
 /**
  * A4 pixel size at a resolution. URF is stricter than PWG here: the DPI in the
@@ -82,13 +82,19 @@ export async function imageToUrf(buf: Buffer, dpi?: number): Promise<Buffer> {
   return Buffer.concat([fileHeader(1), encodeUrfPage(await Jimp.read(buf), w, h, d)]);
 }
 
-/** A PDF → multi-page URF, one raster page per PDF page. */
+/**
+ * A PDF → multi-page URF, one raster page per PDF page. Rendered and encoded a
+ * page at a time so peak memory is one A4 bitmap, not the whole document; the
+ * file header (which must carry the page count up front) is prepended once every
+ * page has been encoded.
+ */
 export async function pdfToUrf(pdf: Buffer, dpi?: number): Promise<Buffer> {
   const d = normaliseDpi(dpi);
   const { w, h } = a4Dims(d);
-  const images = await pdfToImages(pdf);
-  if (images.length === 0) throw new Error("PDF produced no pages to rasterise.");
-  const chunks: Buffer[] = [fileHeader(images.length)];
-  for (const img of images) chunks.push(encodeUrfPage(img, w, h, d));
-  return Buffer.concat(chunks);
+  const pages: Buffer[] = [];
+  await forEachPdfPage(pdf, (img) => {
+    pages.push(encodeUrfPage(img, w, h, d));
+  });
+  if (pages.length === 0) throw new Error("PDF produced no pages to rasterise.");
+  return Buffer.concat([fileHeader(pages.length), ...pages]);
 }

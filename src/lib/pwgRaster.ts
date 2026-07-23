@@ -8,7 +8,7 @@
 // only (count 0–127 → pixel repeated count+1 times), which is always valid and
 // compresses the large white margins well.
 import Jimp from "jimp";
-import { pdfToImages } from "./pdfRender";
+import { forEachPdfPage } from "./pdfRender";
 
 const PAGE_W_PT = 595; // A4 in points
 const PAGE_H_PT = 842;
@@ -126,13 +126,25 @@ export async function imageToPwgRaster(buf: Buffer, dpi?: number): Promise<Buffe
   return Buffer.concat([Buffer.from("RaS2", "ascii"), encodePwgPage(canvas, 1, d)]);
 }
 
-/** A PDF → multi-page PWG-Raster, one raster page per PDF page. */
+/**
+ * A PDF → multi-page PWG-Raster, one raster page per PDF page.
+ *
+ * Pages are rendered and encoded one at a time (each heavy A4 bitmap is dropped
+ * the moment it's compressed), so peak memory is a single page's bitmap plus the
+ * small PackBits output — not the whole document. The per-page header carries a
+ * TotalPageCount; since streaming means we don't know the total until the end,
+ * we patch it into each page's header once counting is done. It's advisory
+ * metadata, so this is purely cosmetic correctness, not a print requirement.
+ */
 export async function pdfToPwgRaster(pdf: Buffer, dpi?: number): Promise<Buffer> {
   const d = normaliseDpi(dpi);
   const { w, h } = a4Dims(d);
-  const images = await pdfToImages(pdf);
-  if (images.length === 0) throw new Error("PDF produced no pages to rasterise.");
-  const chunks: Buffer[] = [Buffer.from("RaS2", "ascii")];
-  for (const img of images) chunks.push(encodePwgPage(fitOntoA4(img, w, h), images.length, d));
-  return Buffer.concat(chunks);
+  const pages: Buffer[] = [];
+  await forEachPdfPage(pdf, (img) => {
+    pages.push(encodePwgPage(fitOntoA4(img, w, h), 0, d));
+  });
+  if (pages.length === 0) throw new Error("PDF produced no pages to rasterise.");
+  // Patch the now-known page count into each page header (offset 452).
+  for (const page of pages) page.writeUInt32BE(pages.length, 452);
+  return Buffer.concat([Buffer.from("RaS2", "ascii"), ...pages]);
 }
